@@ -1,13 +1,13 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Cosmic Chess Engine - WebRTC via Render Signaling</title>
+    <title>Cosmic Chess Engine - Debugging King Safety</title>
     <style>
         body { margin: 0; overflow: hidden; background-image: url('your-park-chess-image.jpg'); background-size: cover; background-position: center center; background-repeat: no-repeat; color: white; font-family: 'Arial', sans-serif; }
         #uiPanel { position: absolute; top: 0; left: 0; width: 100%; padding: 10px 15px; box-sizing: border-box; background-color: rgba(10,10,15,0.85); display: flex; justify-content: space-between; align-items: center; font-size: 1.0em; text-shadow: 0 0 5px #000000; z-index: 80; }
         .timerDisplay { font-weight: bold; color: #F0F0F0; }
         #turnLabel { font-weight: bold; color: #F0F0F0; text-align: center; flex-grow: 1;}
-        #messageLabel { color: #87CEFA; text-align: right; min-width: 200px;}
+        #messageLabel { color: #87CEFA; text-align: right; min-width: 200px; }
         canvas { display: block; }
         #videoContainer { position: absolute; top: 60px; left: 10px; display: none; flex-direction: column; gap: 5px; z-index: 100; background-color: rgba(0,0,0,0.5); padding: 5px; border-radius: 3px; }
         .videoBox { width: 160px; height: 120px; border: 1px solid #555; background-color: #080808; border-radius: 3px; object-fit: cover; }
@@ -27,7 +27,7 @@
     </style>
 </head>
 <body>
-    <div id="uiPanel"> <span id="whiteTimerDisplay" class="timerDisplay">W: 05:00</span> <span id="turnLabel">WHITE'S TURN</span> <span id="blackTimerDisplay" class="timerDisplay">B: 05:00</span> <span id="messageLabel"></span> </div>
+    <div id="uiPanel"> <span id="whiteTimerDisplay" class="timerDisplay">W: 05:00</span> <span id="turnLabel">WHITE'S TURN</span> <span id="blackTimerDisplay" class="timerDisplay">B: 05:00</span> <span id="messageLabel">Initial Message</span> </div>
     <div id="videoContainer"> <video id="localVideo" class="videoBox" autoplay playsinline muted></video> <video id="remoteVideo" class="videoBox" autoplay playsinline></video> </div>
     <div id="connectionUi"> <input type="text" id="roomIdInput" placeholder="Room ID (if joining)"> <button id="createRoomBtnWebRTC">Create/Join Room</button> <div id="connectionStatus" style="font-size:0.8em; color:#ccc; margin-top:5px;">Status: Disconnected</div> </div>
     <div id="aiTrainerPanel"><h4 >AI Suggestions:</h4><div id="topMovesList"></div></div>
@@ -47,35 +47,24 @@
         const PieceType={EMPTY:0,PAWN:1,KNIGHT:2,BISHOP:3,ROOK:4,QUEEN:5,KING:6,_length:7};
         const PlayerColor={NONE:0,WHITE:1,BLACK:2,_length:3};
         class Piece{constructor(t,c){this.type=t;this.color=c;this.hasMoved=false;}clone(){const nP=new Piece(this.type,this.color);nP.hasMoved=this.hasMoved;return nP;}}
-
         let scene,camera,renderer,boardGroup,particlesPoints;
         let pieceMeshes={}; let squareMeshes={};
         const BOARD_LOGIC_SIZE=8;const SQUARE_3D_SIZE=10;const SQUARE_THICKNESS=0.5; const BORDER_WIDTH=SQUARE_3D_SIZE*0.25; const PIECE_BASE_SCALE=SQUARE_3D_SIZE*0.30;const GAME_TIME_SECONDS=5*60;
         const PARTICLE_COUNT = 100;
         let boardLogic=Array(BOARD_LOGIC_SIZE).fill(null).map(()=>Array(BOARD_LOGIC_SIZE).fill(new Piece(PieceType.EMPTY,PlayerColor.NONE)));let currentPlayer=PlayerColor.WHITE;let selectedPieceInfo=null;let isPlayerTurn=true;let timerWhite,timerBlack;let activeTimerSide=null;let gameTimerInterval=null;let isGameOverState=false;
-
         let turnLabelElement,messageLabelElement,whiteTimerDisplayElement,blackTimerDisplayElement,localVideoElementRTC,remoteVideoElementRTC,roomIdInputRTC,createJoinRoomBtnRTC,connectionStatusRTC,videoContainerRTC, aiTrainerPanelElement, topMovesListElement;
         let playerMoveTimerDisplayElement, aiMoveTimerDisplayElement;
         let radioScreenElement, prevTrackBtnElement, playPauseBtnElement, nextTrackBtnElement, backgroundMusicElement;
-
         let audioMove, audioCapture, audioCheck, audioWin, audioLose, audioStalemate;
-
         const radioTracks = [ { name: "Radio Song 1", src: "sounds/Radio_song1.mp3" } ];
         let currentTrackIndex = 0;
         let isRadioPlaying = false;
-
         let playerMoveTime = 0; let aiMoveTime = 0; let currentMoveTimerInterval = null;
-
-        // WebRTC Variables
-        let localStreamRTC;
-        let remoteStreamRTC;
-        let peerConnectionRTC;
-        let isWebRTCInitiator = false; // True if this client is initiating the WebRTC offer
+        let localStreamRTC, remoteStreamRTC, peerConnectionRTC;
+        let isWebRTCInitiator = false;
         const rtcConfiguration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-        let signalingSocket; // WebSocket for signaling
-        let currentRoomIdRTC; // To store the current room ID from the server
-
-
+        let signalingSocket;
+        let currentRoomIdRTC;
         const lightSquareMat=new THREE.MeshStandardMaterial({color:0xCCCCCC,roughness:0.8,metalness:0.1});
         const darkSquareMat=new THREE.MeshStandardMaterial({color:0x505050,roughness:0.8,metalness:0.1});
         const borderMat=new THREE.MeshStandardMaterial({color:0x121212,roughness:0.8,metalness:0.0});
@@ -86,350 +75,62 @@
 
         // --- CORE FUNCTIONS (Sound, UI, Timers) ---
         function playSound(audioElement) { if (audioElement) { audioElement.currentTime = 0; const playPromise = audioElement.play(); if (playPromise !== undefined) { playPromise.catch(error => console.warn(`Audio play failed for ${audioElement.id || 'audio'}:`, error)); } } else { console.warn("playSound called with null audioElement"); } }
-        function updateTurnLabel(){ turnLabelElement.textContent = `${(currentPlayer === PlayerColor.WHITE ? "WHITE" : "BLACK")}'S TURN`; }
-        function setMessage(msg){ if(messageLabelElement) messageLabelElement.textContent = msg; console.log("Message:", msg); }
-        function onWindowResize(){ camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); }
+        function updateTurnLabel(){ if(turnLabelElement) turnLabelElement.textContent = `${(currentPlayer === PlayerColor.WHITE ? "WHITE" : "BLACK")}'S TURN`; else console.warn("turnLabelElement not found for updateTurnLabel"); }
+        function setMessage(msg){ if(messageLabelElement) messageLabelElement.textContent = msg; console.log("setMessage called with:", msg); if (!messageLabelElement) console.warn("messageLabelElement not found for setMessage"); }
+        function onWindowResize(){ if(camera && renderer) {camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight);} }
         function formatMoveTime(seconds) { const mins = Math.floor(seconds / 60).toString().padStart(2, '0'); const secs = (seconds % 60).toString().padStart(2, '0'); return `${mins}:${secs}`; }
         function updateMoveTimerDisplay() { if (playerMoveTimerDisplayElement) playerMoveTimerDisplayElement.textContent = `Player Move: ${formatMoveTime(playerMoveTime)}`; if (aiMoveTimerDisplayElement) aiMoveTimerDisplayElement.textContent = `AI Move: ${formatMoveTime(aiMoveTime)}`; }
         function startCurrentMoveTimer(forPlayer) { stopCurrentMoveTimer(); if (forPlayer === PlayerColor.WHITE) { playerMoveTime = 0; } else { aiMoveTime = 0; } updateMoveTimerDisplay(); currentMoveTimerInterval = setInterval(() => { if (forPlayer === PlayerColor.WHITE) { playerMoveTime++; } else { aiMoveTime++; } updateMoveTimerDisplay(); }, 1000); }
         function stopCurrentMoveTimer() { if (currentMoveTimerInterval) clearInterval(currentMoveTimerInterval); currentMoveTimerInterval = null; }
-        function updateRadioDisplay() { if (!radioScreenElement || !playPauseBtnElement || !backgroundMusicElement) return; if (isRadioPlaying) { radioScreenElement.textContent = radioTracks[currentTrackIndex].name; playPauseBtnElement.textContent = "||"; } else { radioScreenElement.textContent = "Radio Off"; playPauseBtnElement.textContent = ">"; } }
-        function togglePlayPauseRadio() { if (!backgroundMusicElement) return; if (isRadioPlaying) { backgroundMusicElement.pause(); isRadioPlaying = false; } else { const playPromise = backgroundMusicElement.play(); if (playPromise !== undefined) { playPromise.then(_ => { isRadioPlaying = true; updateRadioDisplay(); }).catch(error => { console.warn("Radio play failed:", error); setMessage("Click radio play again."); isRadioPlaying = false; }); } } updateRadioDisplay(); }
-        function nextRadioTrack() { if (!backgroundMusicElement || radioTracks.length === 0) return; currentTrackIndex = (currentTrackIndex + 1) % radioTracks.length; backgroundMusicElement.src = radioTracks[currentTrackIndex].src; if (isRadioPlaying) { const playPromise = backgroundMusicElement.play(); if (playPromise !== undefined) { playPromise.catch(error => { console.warn("Next track play failed:", error); isRadioPlaying = false; updateRadioDisplay(); }); } } updateRadioDisplay(); }
-        function prevRadioTrack() { if (!backgroundMusicElement || radioTracks.length === 0) return; currentTrackIndex = (currentTrackIndex - 1 + radioTracks.length) % radioTracks.length; backgroundMusicElement.src = radioTracks[currentTrackIndex].src; if (isRadioPlaying) { const playPromise = backgroundMusicElement.play(); if (playPromise !== undefined) { playPromise.catch(error => { console.warn("Prev track play failed:", error); isRadioPlaying = false; updateRadioDisplay(); }); } } updateRadioDisplay(); }
+        function updateRadioDisplay() { if (!radioScreenElement || !playPauseBtnElement || !backgroundMusicElement) {console.warn("Radio elements missing for updateRadioDisplay"); return;} if (isRadioPlaying) { radioScreenElement.textContent = radioTracks[currentTrackIndex].name; playPauseBtnElement.textContent = "||"; } else { radioScreenElement.textContent = "Radio Off"; playPauseBtnElement.textContent = ">"; } }
+        function togglePlayPauseRadio() { if (!backgroundMusicElement) {console.warn("backgroundMusicElement missing for togglePlayPauseRadio"); return;} if (isRadioPlaying) { backgroundMusicElement.pause(); isRadioPlaying = false; } else { const playPromise = backgroundMusicElement.play(); if (playPromise !== undefined) { playPromise.then(_ => { isRadioPlaying = true; updateRadioDisplay(); }).catch(error => { console.warn("Radio play failed:", error); setMessage("Click radio play again."); isRadioPlaying = false; }); } } updateRadioDisplay(); }
+        function nextRadioTrack() { if (!backgroundMusicElement || radioTracks.length === 0) {console.warn("Radio elements missing for nextRadioTrack"); return;} currentTrackIndex = (currentTrackIndex + 1) % radioTracks.length; backgroundMusicElement.src = radioTracks[currentTrackIndex].src; if (isRadioPlaying) { const playPromise = backgroundMusicElement.play(); if (playPromise !== undefined) { playPromise.catch(error => { console.warn("Next track play failed:", error); isRadioPlaying = false; updateRadioDisplay(); }); } } updateRadioDisplay(); }
+        function prevRadioTrack() { if (!backgroundMusicElement || radioTracks.length === 0) {console.warn("Radio elements missing for prevRadioTrack");return;} currentTrackIndex = (currentTrackIndex - 1 + radioTracks.length) % radioTracks.length; backgroundMusicElement.src = radioTracks[currentTrackIndex].src; if (isRadioPlaying) { const playPromise = backgroundMusicElement.play(); if (playPromise !== undefined) { playPromise.catch(error => { console.warn("Prev track play failed:", error); isRadioPlaying = false; updateRadioDisplay(); }); } } updateRadioDisplay(); }
 
         // --- WebRTC and Signaling Functions ---
-        function connectSignalingServer() {
-            signalingSocket = new WebSocket('wss://threed-nano-chess.onrender.com'); // Your Render server URL
-
-            signalingSocket.onopen = () => {
-                console.log('Connected to signaling server.');
-                connectionStatusRTC.textContent = 'Status: Connected to signaling. Joining room...';
-                const roomId = roomIdInputRTC.value.trim(); // Use user input or allow server to generate
-                signalingSocket.send(JSON.stringify({ type: 'join_room', roomId: roomId }));
-            };
-
-            signalingSocket.onmessage = async (event) => {
-                const message = JSON.parse(event.data);
-                console.log('Message from signaling server:', message);
-
-                switch (message.type) {
-                    case 'room_joined':
-                        currentRoomIdRTC = message.roomId;
-                        roomIdInputRTC.value = currentRoomIdRTC; // Update UI with actual room ID
-                        connectionStatusRTC.textContent = `Status: Joined room ${currentRoomIdRTC}. Peers: ${message.numClients}. You are peer ${message.peerIndex}.`;
-                        if (message.numClients < 2) {
-                            setMessage(`In room ${currentRoomIdRTC}. Waiting for opponent...`);
-                        }
-                        break;
-                    case 'room_full':
-                        connectionStatusRTC.textContent = `Status: Room ${message.roomId} is full.`;
-                        setMessage(`Room ${message.roomId} is full. Try another or new room.`);
-                        signalingSocket.close(); // Or allow trying another room
-                        break;
-                    case 'peer_ready':
-                        isWebRTCInitiator = message.initiator; // Server decides who initiates
-                        connectionStatusRTC.textContent = `Status: Peer ready in ${message.roomId}. You are ${isWebRTCInitiator ? 'initiator' : 'receiver'}. Starting WebRTC...`;
-                        await startLocalVideoAndCreatePC();
-                        break;
-                    case 'offer':
-                        if (!isWebRTCInitiator) { // Receiver handles offer
-                            connectionStatusRTC.textContent = 'Status: Received offer...';
-                            await handleOffer(message.sdp);
-                        }
-                        break;
-                    case 'answer':
-                        if (isWebRTCInitiator) { // Initiator handles answer
-                            connectionStatusRTC.textContent = 'Status: Received answer...';
-                            await handleAnswer(message.sdp);
-                        }
-                        break;
-                    case 'candidate':
-                        connectionStatusRTC.textContent = 'Status: Received ICE candidate...';
-                        await handleCandidate(message.candidate);
-                        break;
-                    case 'peer_disconnected':
-                        connectionStatusRTC.textContent = 'Status: Peer disconnected.';
-                        setMessage("Your opponent has disconnected from the room.");
-                        closeWebRTCConnection();
-                        break;
-                    case 'error':
-                        console.error("Signaling server error:", message.message);
-                        connectionStatusRTC.textContent = `Status: Signaling Error - ${message.message}`;
-                        break;
-                    default:
-                         console.warn("Unknown message type from server:", message.type);
-                }
-            };
-
-            signalingSocket.onclose = (event) => {
-                console.log('Disconnected from signaling server.', event.reason);
-                // Avoid overwriting critical error messages
-                if (!connectionStatusRTC.textContent.toLowerCase().includes('error') && !connectionStatusRTC.textContent.toLowerCase().includes('full')) {
-                     connectionStatusRTC.textContent = 'Status: Disconnected from signaling.';
-                }
-                // Optionally, try to reconnect or prompt user
-            };
-
-            signalingSocket.onerror = (error) => {
-                console.error('Signaling WebSocket error:', error);
-                connectionStatusRTC.textContent = 'Status: Signaling connection error.';
-                setMessage("Could not connect to the signaling service.");
-            };
-        }
-
-        async function startLocalVideoAndCreatePC() {
-            if (!localStreamRTC) {
-                try {
-                    await startLocalVideo(); // Ensure local video is started first
-                } catch (error) {
-                     setMessage("Cannot start WebRTC without local video.");
-                     connectionStatusRTC.textContent = "Status: Camera/Mic access failed.";
-                     return false;
-                }
-            }
-            createPeerConnection(); // Now create the peer connection
-            return true;
-        }
-
-        async function startLocalVideo() { // Made async to use await
-            try {
-                localStreamRTC = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                localVideoElementRTC.srcObject = localStreamRTC;
-                videoContainerRTC.style.display = 'flex';
-                // Don't set status here, let the calling context do it
-                if (peerConnectionRTC) { // If PC exists (e.g., re-negotiation or late track add)
-                    localStreamRTC.getTracks().forEach(track => {
-                        const sender = peerConnectionRTC.getSenders().find(s => s.track && s.track.kind === track.kind);
-                        if (sender) {
-                            sender.replaceTrack(track).catch(e => console.error("Error replacing track:", e));
-                        } else {
-                            peerConnectionRTC.addTrack(track, localStreamRTC);
-                        }
-                    });
-                }
-            } catch (error) {
-                console.error('Error accessing media devices.', error);
-                setMessage('Could not access camera/microphone.');
-                throw error; // Re-throw to be caught by caller
-            }
-        }
-
-        function createPeerConnection() {
-            if (peerConnectionRTC) {
-                console.log("Closing existing peer connection.");
-                peerConnectionRTC.close();
-            }
-            peerConnectionRTC = new RTCPeerConnection(rtcConfiguration);
-            console.log("Peer connection created.");
-            // connectionStatusRTC.textContent = 'Status: Peer connection created.'; // Status set by caller context
-
-            peerConnectionRTC.onicecandidate = event => {
-                if (event.candidate && signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
-                    console.log('Local ICE candidate found, sending to server:', event.candidate);
-                    signalingSocket.send(JSON.stringify({
-                        type: 'candidate',
-                        candidate: event.candidate,
-                        roomId: currentRoomIdRTC // Ensure room ID is included
-                    }));
-                }
-            };
-
-            peerConnectionRTC.ontrack = event => {
-                console.log('Remote track received:', event.track.kind);
-                if (event.streams && event.streams[0]) {
-                    remoteVideoElementRTC.srcObject = event.streams[0];
-                    connectionStatusRTC.textContent = 'Status: Connected to peer!';
-                    setMessage("Video connection established with opponent.");
-                } else { // Fallback for older browsers or individual tracks
-                    if (!remoteVideoElementRTC.srcObject) {
-                        remoteVideoElementRTC.srcObject = new MediaStream();
-                    }
-                    remoteVideoElementRTC.srcObject.addTrack(event.track);
-                }
-            };
-
-            peerConnectionRTC.onnegotiationneeded = async () => {
-                console.log('Negotiation needed. isWebRTCInitiator:', isWebRTCInitiator, 'Signaling state:', peerConnectionRTC.signalingState);
-                // Only initiator creates offer, and only if connection is stable (no existing offer/answer process)
-                if (isWebRTCInitiator && peerConnectionRTC.signalingState === "stable") {
-                    try {
-                        connectionStatusRTC.textContent = 'Status: Creating WebRTC offer...';
-                        console.log('Creating offer...');
-                        const offer = await peerConnectionRTC.createOffer();
-                        await peerConnectionRTC.setLocalDescription(offer);
-                        if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
-                            console.log('Sending offer to server:', peerConnectionRTC.localDescription);
-                            signalingSocket.send(JSON.stringify({
-                                type: 'offer',
-                                sdp: peerConnectionRTC.localDescription,
-                                roomId: currentRoomIdRTC // Ensure room ID is included
-                            }));
-                            connectionStatusRTC.textContent = 'Status: Offer sent.';
-                        }
-                    } catch (error) {
-                        console.error('Error creating/sending offer:', error);
-                        connectionStatusRTC.textContent = 'Status: Error creating offer.';
-                    }
-                }
-            };
-
-            // Add local tracks if stream is already available
-            if (localStreamRTC) {
-                console.log("Adding local stream tracks to new peer connection.");
-                localStreamRTC.getTracks().forEach(track => peerConnectionRTC.addTrack(track, localStreamRTC));
-            } else {
-                console.warn("Local stream not available when creating peer connection. Tracks will be added later if stream starts.");
-            }
-        }
-
-        async function handleOffer(offerSdp) {
-            if (!peerConnectionRTC) {
-                console.warn("Received offer but PeerConnection is not ready. Attempting to initialize.");
-                if (!(await startLocalVideoAndCreatePC())) { // This calls createPeerConnection internally
-                     console.error("Failed to setup local media/PC for handling offer.");
-                     setMessage("Error setting up for offer.");
-                     return;
-                }
-            }
-             // Check if an offer (local or remote) is already in progress.
-            if (peerConnectionRTC.signalingState !== "stable" && peerConnectionRTC.signalingState !== "have-remote-offer") {
-                console.warn(`Cannot handle offer in signalingState: ${peerConnectionRTC.signalingState}. Possible glare.`);
-                // Basic glare handling: if we are also an initiator and have a local offer, perhaps one side yields.
-                // For simplicity here, we just log and proceed cautiously or could return.
-                // A more robust solution might involve comparing initiator flags or random tie-breaking.
-                // If we already have a remote offer, this might be a duplicate or race condition.
-            }
-            try {
-                console.log("Setting remote offer description.");
-                await peerConnectionRTC.setRemoteDescription(new RTCSessionDescription(offerSdp));
-                connectionStatusRTC.textContent = 'Status: Offer received. Creating answer...';
-                console.log('Creating answer...');
-                const answer = await peerConnectionRTC.createAnswer();
-                await peerConnectionRTC.setLocalDescription(answer);
-                if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
-                    console.log('Sending answer to server:', peerConnectionRTC.localDescription);
-                    signalingSocket.send(JSON.stringify({
-                        type: 'answer',
-                        sdp: peerConnectionRTC.localDescription,
-                        roomId: currentRoomIdRTC // Ensure room ID is included
-                    }));
-                    connectionStatusRTC.textContent = 'Status: Answer sent.';
-                }
-            } catch (error) {
-                console.error('Error handling offer / creating answer:', error);
-                connectionStatusRTC.textContent = 'Status: Error processing offer.';
-            }
-        }
-
-        async function handleAnswer(answerSdp) {
-            if (!peerConnectionRTC || peerConnectionRTC.signalingState !== 'have-local-offer') {
-                 console.warn(`Cannot handle answer. PC not ready or not in 'have-local-offer' state. Current state: ${peerConnectionRTC ? peerConnectionRTC.signalingState : 'null'}`);
-                 connectionStatusRTC.textContent = 'Status: Error: Invalid state for answer.';
-                 return;
-            }
-            try {
-                console.log("Setting remote answer description.");
-                await peerConnectionRTC.setRemoteDescription(new RTCSessionDescription(answerSdp));
-                console.log('Remote answer set. Connection should establish.');
-                connectionStatusRTC.textContent = 'Status: Answer received. Connecting...';
-            } catch (error) {
-                console.error('Error handling answer:', error);
-                connectionStatusRTC.textContent = 'Status: Error processing answer.';
-            }
-        }
-
-        async function handleCandidate(candidate) {
-            if (!peerConnectionRTC) {
-                 console.warn("Cannot handle ICE candidate. PeerConnection not ready.");
-                 connectionStatusRTC.textContent = 'Status: Error: PC not ready for ICE.';
-                 return;
-            }
-            try {
-                if (candidate) { // Ensure candidate is not null/empty
-                    console.log("Adding received ICE candidate:", candidate);
-                    await peerConnectionRTC.addIceCandidate(new RTCIceCandidate(candidate));
-                    console.log('ICE candidate added.');
-                } else {
-                    console.log("Received null/empty ICE candidate, ignoring.");
-                }
-            } catch (error) {
-                 // It's common to get an error if the PC is not yet in a state to add candidates (e.g., remote description not set)
-                 // or if it's an empty candidate string after the "end-of-candidates" signal.
-                if (candidate && candidate.candidate) { // Only log actual errors for non-empty candidates
-                    console.error('Error adding received ICE candidate:', error);
-                }
-            }
-        }
-
-        function setupAndJoinOrCreateRoom(){
-            if (signalingSocket && (signalingSocket.readyState === WebSocket.OPEN || signalingSocket.readyState === WebSocket.CONNECTING)) {
-                console.log("Signaling connection already open or connecting. Closing to restart.");
-                signalingSocket.close();
-            }
-            // Reset WebRTC state before attempting new connection
-            closeWebRTCConnection();
-            connectionStatusRTC.textContent = 'Status: Connecting to signaling...';
-            connectSignalingServer();
-        }
-
-        function closeWebRTCConnection() {
-            if (localStreamRTC) {
-                localStreamRTC.getTracks().forEach(track => track.stop());
-                localStreamRTC = null;
-                localVideoElementRTC.srcObject = null;
-            }
-            if (remoteStreamRTC) { // remoteStreamRTC is set in ontrack, ensure it's cleared
-                remoteStreamRTC.getTracks().forEach(track => track.stop());
-                remoteStreamRTC = null;
-                remoteVideoElementRTC.srcObject = null;
-            }
-            if (peerConnectionRTC) {
-                peerConnectionRTC.onicecandidate = null;
-                peerConnectionRTC.ontrack = null;
-                peerConnectionRTC.onnegotiationneeded = null;
-                peerConnectionRTC.close();
-                peerConnectionRTC = null;
-            }
-            videoContainerRTC.style.display = 'none';
-            isWebRTCInitiator = false; // Reset initiator state
-            // currentRoomIdRTC is usually kept until a new room is joined or explicitly left
-            console.log("WebRTC connection and streams closed.");
-        }
+        // ... (This section remains the same as the previous fully rebuilt version with Render signaling)
+        function connectSignalingServer() { signalingSocket = new WebSocket('wss://threed-nano-chess.onrender.com'); signalingSocket.onopen = () => { console.log('Connected to signaling server.'); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Connected to signaling. Joining room...'; const roomId = roomIdInputRTC ? roomIdInputRTC.value.trim() : ""; signalingSocket.send(JSON.stringify({ type: 'join_room', roomId: roomId })); }; signalingSocket.onmessage = async (event) => { const message = JSON.parse(event.data); console.log('Message from signaling server:', message); switch (message.type) { case 'room_joined': currentRoomIdRTC = message.roomId; if(roomIdInputRTC) roomIdInputRTC.value = currentRoomIdRTC; if(connectionStatusRTC) connectionStatusRTC.textContent = `Status: Joined room ${currentRoomIdRTC}. Peers: ${message.numClients}. You are peer ${message.peerIndex}.`; if (message.numClients < 2) { setMessage(`In room ${currentRoomIdRTC}. Waiting for opponent...`); } break; case 'room_full': if(connectionStatusRTC) connectionStatusRTC.textContent = `Status: Room ${message.roomId} is full.`; setMessage(`Room ${message.roomId} is full. Try another or new room.`); if (signalingSocket) signalingSocket.close(); break; case 'peer_ready': isWebRTCInitiator = message.initiator; if(connectionStatusRTC) connectionStatusRTC.textContent = `Status: Peer ready in ${message.roomId}. You are ${isWebRTCInitiator ? 'initiator' : 'receiver'}. Starting WebRTC...`; await startLocalVideoAndCreatePC(); break; case 'offer': if (!isWebRTCInitiator) { if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Received offer...'; await handleOffer(message.sdp); } break; case 'answer': if (isWebRTCInitiator) { if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Received answer...'; await handleAnswer(message.sdp); } break; case 'candidate': if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Received ICE candidate...'; await handleCandidate(message.candidate); break; case 'peer_disconnected': if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Peer disconnected.'; setMessage("Your opponent has disconnected from the room."); closeWebRTCConnection(); break; case 'error': console.error("Signaling server error:", message.message); if(connectionStatusRTC) connectionStatusRTC.textContent = `Status: Signaling Error - ${message.message}`; break; default: console.warn("Unknown message type from server:", message.type); } }; signalingSocket.onclose = (event) => { console.log('Disconnected from signaling server.', event.reason); if (connectionStatusRTC && !connectionStatusRTC.textContent.toLowerCase().includes('error') && !connectionStatusRTC.textContent.toLowerCase().includes('full')) { connectionStatusRTC.textContent = 'Status: Disconnected from signaling.'; } }; signalingSocket.onerror = (error) => { console.error('Signaling WebSocket error:', error); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Signaling connection error.'; setMessage("Could not connect to the signaling service."); }; }
+        async function startLocalVideoAndCreatePC() { if (!localStreamRTC) { try { await startLocalVideo(); } catch (error) { setMessage("Cannot start WebRTC without local video."); if(connectionStatusRTC) connectionStatusRTC.textContent = "Status: Camera/Mic access failed."; return false; } } createPeerConnection(); return true; }
+        async function startLocalVideo() { try { localStreamRTC = await navigator.mediaDevices.getUserMedia({ video: true, audio: true }); if(localVideoElementRTC) localVideoElementRTC.srcObject = localStreamRTC; if(videoContainerRTC) videoContainerRTC.style.display = 'flex'; if (peerConnectionRTC) { localStreamRTC.getTracks().forEach(track => { const sender = peerConnectionRTC.getSenders().find(s => s.track && s.track.kind === track.kind); if (sender) { sender.replaceTrack(track).catch(e => console.error("Error replacing track:", e)); } else { peerConnectionRTC.addTrack(track, localStreamRTC); } }); } } catch (error) { console.error('Error accessing media devices.', error); setMessage('Could not access camera/microphone.'); throw error; } }
+        function createPeerConnection() { if (peerConnectionRTC) { console.log("Closing existing peer connection."); peerConnectionRTC.close(); } peerConnectionRTC = new RTCPeerConnection(rtcConfiguration); console.log("Peer connection created."); peerConnectionRTC.onicecandidate = event => { if (event.candidate && signalingSocket && signalingSocket.readyState === WebSocket.OPEN) { console.log('Local ICE candidate found, sending to server:', event.candidate); signalingSocket.send(JSON.stringify({ type: 'candidate', candidate: event.candidate, roomId: currentRoomIdRTC })); } }; peerConnectionRTC.ontrack = event => { console.log('Remote track received:', event.track.kind); if (event.streams && event.streams[0]) { if(remoteVideoElementRTC) remoteVideoElementRTC.srcObject = event.streams[0]; if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Connected to peer!'; setMessage("Video connection established with opponent."); } else { if(remoteVideoElementRTC && !remoteVideoElementRTC.srcObject) { remoteVideoElementRTC.srcObject = new MediaStream(); } if(remoteVideoElementRTC) remoteVideoElementRTC.srcObject.addTrack(event.track); } }; peerConnectionRTC.onnegotiationneeded = async () => { console.log('Negotiation needed. isWebRTCInitiator:', isWebRTCInitiator, 'Signaling state:', peerConnectionRTC.signalingState); if (isWebRTCInitiator && peerConnectionRTC.signalingState === "stable") { try { if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Creating WebRTC offer...'; console.log('Creating offer...'); const offer = await peerConnectionRTC.createOffer(); await peerConnectionRTC.setLocalDescription(offer); if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) { console.log('Sending offer to server:', peerConnectionRTC.localDescription); signalingSocket.send(JSON.stringify({ type: 'offer', sdp: peerConnectionRTC.localDescription, roomId: currentRoomIdRTC })); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Offer sent.'; } } catch (error) { console.error('Error creating/sending offer:', error); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Error creating offer.'; } } }; if (localStreamRTC) { console.log("Adding local stream tracks to new peer connection."); localStreamRTC.getTracks().forEach(track => peerConnectionRTC.addTrack(track, localStreamRTC)); } else { console.warn("Local stream not available when creating peer connection."); } }
+        async function handleOffer(offerSdp) { if (!peerConnectionRTC) { console.warn("Received offer but PeerConnection is not ready. Attempting to initialize."); if (!(await startLocalVideoAndCreatePC())) { console.error("Failed to setup local media/PC for handling offer."); setMessage("Error setting up for offer."); return; } } if (peerConnectionRTC.signalingState !== "stable" && peerConnectionRTC.signalingState !== "have-remote-offer") { console.warn(`Cannot handle offer in signalingState: ${peerConnectionRTC.signalingState}.`); return; } try { console.log("Setting remote offer description."); await peerConnectionRTC.setRemoteDescription(new RTCSessionDescription(offerSdp)); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Offer received. Creating answer...'; console.log('Creating answer...'); const answer = await peerConnectionRTC.createAnswer(); await peerConnectionRTC.setLocalDescription(answer); if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) { console.log('Sending answer to server:', peerConnectionRTC.localDescription); signalingSocket.send(JSON.stringify({ type: 'answer', sdp: peerConnectionRTC.localDescription, roomId: currentRoomIdRTC })); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Answer sent.'; } } catch (error) { console.error('Error handling offer / creating answer:', error); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Error processing offer.'; } }
+        async function handleAnswer(answerSdp) { if (!peerConnectionRTC || peerConnectionRTC.signalingState !== 'have-local-offer') { console.warn(`Cannot handle answer. PC not ready or not in 'have-local-offer' state. State: ${peerConnectionRTC ? peerConnectionRTC.signalingState : 'null'}`); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Error: Invalid state for answer.'; return; } try { console.log("Setting remote answer description."); await peerConnectionRTC.setRemoteDescription(new RTCSessionDescription(answerSdp)); console.log('Remote answer set. Connection should establish.'); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Answer received. Connecting...'; } catch (error) { console.error('Error handling answer:', error); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Error processing answer.'; } }
+        async function handleCandidate(candidate) { if (!peerConnectionRTC) { console.warn("Cannot handle ICE candidate. PeerConnection not ready."); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Error: PC not ready for ICE.'; return; } try { if (candidate) { console.log("Adding received ICE candidate:", candidate); await peerConnectionRTC.addIceCandidate(new RTCIceCandidate(candidate)); console.log('ICE candidate added.'); } else { console.log("Received null/empty ICE candidate, ignoring."); } } catch (error) { if (candidate && candidate.candidate) { console.error('Error adding received ICE candidate:', error); } } }
+        function setupAndJoinOrCreateRoom(){ if (signalingSocket && (signalingSocket.readyState === WebSocket.OPEN || signalingSocket.readyState === WebSocket.CONNECTING)) { console.log("Signaling connection already open or connecting. Closing to restart."); signalingSocket.close(); } closeWebRTCConnection(); if(connectionStatusRTC) connectionStatusRTC.textContent = 'Status: Connecting to signaling...'; connectSignalingServer(); }
+        function closeWebRTCConnection() { if (localStreamRTC) { localStreamRTC.getTracks().forEach(track => track.stop()); localStreamRTC = null; if(localVideoElementRTC) localVideoElementRTC.srcObject = null; } if (remoteStreamRTC) { remoteStreamRTC.getTracks().forEach(track => track.stop()); remoteStreamRTC = null; if(remoteVideoElementRTC) remoteVideoElementRTC.srcObject = null; } if (peerConnectionRTC) { peerConnectionRTC.onicecandidate = null; peerConnectionRTC.ontrack = null; peerConnectionRTC.onnegotiationneeded = null; peerConnectionRTC.close(); peerConnectionRTC = null; } if(videoContainerRTC) videoContainerRTC.style.display = 'none'; isWebRTCInitiator = false; console.log("WebRTC connection and streams closed."); }
 
 
         // --- INITIALIZATION ---
         function init() {
-            console.log("Initializing Cosmic Chess Engine - WebRTC via Render Signaling...");
-            connectionStatusRTC.textContent = 'Status: Disconnected. Click Create/Join.'; // Initial status
+            console.log("Initializing Cosmic Chess Engine - Debugging isValidMove...");
+            turnLabelElement = document.getElementById('turnLabel'); if (!turnLabelElement) console.error("Element 'turnLabel' not found!");
+            messageLabelElement = document.getElementById('messageLabel'); if (!messageLabelElement) console.error("Element 'messageLabel' not found!"); else messageLabelElement.textContent = "";
+            whiteTimerDisplayElement = document.getElementById('whiteTimerDisplay'); if (!whiteTimerDisplayElement) console.error("Element 'whiteTimerDisplay' not found!");
+            blackTimerDisplayElement = document.getElementById('blackTimerDisplay'); if (!blackTimerDisplayElement) console.error("Element 'blackTimerDisplay' not found!");
+            localVideoElementRTC = document.getElementById('localVideo'); if (!localVideoElementRTC) console.error("Element 'localVideo' not found!");
+            remoteVideoElementRTC = document.getElementById('remoteVideo'); if (!remoteVideoElementRTC) console.error("Element 'remoteVideo' not found!");
+            roomIdInputRTC = document.getElementById('roomIdInput'); if (!roomIdInputRTC) console.error("Element 'roomIdInput' not found!");
+            createJoinRoomBtnRTC = document.getElementById('createRoomBtnWebRTC'); if (!createJoinRoomBtnRTC) console.error("Element 'createRoomBtnWebRTC' not found!");
+            connectionStatusRTC = document.getElementById('connectionStatus'); if (!connectionStatusRTC) console.error("Element 'connectionStatus' not found!");
+            videoContainerRTC = document.getElementById('videoContainer'); if (!videoContainerRTC) console.error("Element 'videoContainer' not found!");
+            aiTrainerPanelElement = document.getElementById('aiTrainerPanel'); if (!aiTrainerPanelElement) console.warn("Element 'aiTrainerPanel' not found.");
+            topMovesListElement = document.getElementById('topMovesList'); if (!topMovesListElement) console.warn("Element 'topMovesList' not found.");
+            playerMoveTimerDisplayElement = document.getElementById('playerMoveTimerDisplay'); if (!playerMoveTimerDisplayElement) console.error("Element 'playerMoveTimerDisplay' not found!");
+            aiMoveTimerDisplayElement = document.getElementById('aiMoveTimerDisplay'); if (!aiMoveTimerDisplayElement) console.error("Element 'aiMoveTimerDisplay' not found!");
+            radioScreenElement = document.getElementById('radioScreen'); if (!radioScreenElement) console.warn("Element 'radioScreen' not found.");
+            prevTrackBtnElement = document.getElementById('prevTrackBtn'); if (!prevTrackBtnElement) console.warn("Element 'prevTrackBtn' not found.");
+            playPauseBtnElement = document.getElementById('playPauseBtn'); if (!playPauseBtnElement) console.warn("Element 'playPauseBtn' not found.");
+            nextTrackBtnElement = document.getElementById('nextTrackBtn'); if (!nextTrackBtnElement) console.warn("Element 'nextTrackBtn' not found.");
+            backgroundMusicElement = document.getElementById('backgroundMusic'); if (!backgroundMusicElement) console.warn("Element 'backgroundMusic' not found.");
+            audioMove = document.getElementById('audioMove'); if (!audioMove) console.warn("Element 'audioMove' not found.");
+            audioCapture = document.getElementById('audioCapture'); if (!audioCapture) console.warn("Element 'audioCapture' not found.");
+            audioCheck = document.getElementById('audioCheck'); if (!audioCheck) console.warn("Element 'audioCheck' not found.");
+            audioWin = document.getElementById('audioWin'); if (!audioWin) console.warn("Element 'audioWin' not found.");
+            audioLose = document.getElementById('audioLose'); if (!audioLose) console.warn("Element 'audioLose' not found.");
+            audioStalemate = document.getElementById('audioStalemate'); if (!audioStalemate) console.warn("Element 'audioStalemate' not found.");
 
-            turnLabelElement = document.getElementById('turnLabel');
-            messageLabelElement = document.getElementById('messageLabel');
-            whiteTimerDisplayElement = document.getElementById('whiteTimerDisplay');
-            blackTimerDisplayElement = document.getElementById('blackTimerDisplay');
-            localVideoElementRTC = document.getElementById('localVideo');
-            remoteVideoElementRTC = document.getElementById('remoteVideo');
-            roomIdInputRTC = document.getElementById('roomIdInput');
-            createJoinRoomBtnRTC = document.getElementById('createRoomBtnWebRTC');
-            // connectionStatusRTC = document.getElementById('connectionStatus'); // Already assigned above
-            videoContainerRTC = document.getElementById('videoContainer');
-            aiTrainerPanelElement = document.getElementById('aiTrainerPanel');
-            topMovesListElement = document.getElementById('topMovesList');
-            playerMoveTimerDisplayElement = document.getElementById('playerMoveTimerDisplay');
-            aiMoveTimerDisplayElement = document.getElementById('aiMoveTimerDisplay');
-            radioScreenElement = document.getElementById('radioScreen');
-            prevTrackBtnElement = document.getElementById('prevTrackBtn');
-            playPauseBtnElement = document.getElementById('playPauseBtn');
-            nextTrackBtnElement = document.getElementById('nextTrackBtn');
-            backgroundMusicElement = document.getElementById('backgroundMusic');
-
+            if (connectionStatusRTC) { connectionStatusRTC.textContent = 'Status: Disconnected. Click Create/Join.'; }
             if (createJoinRoomBtnRTC) { createJoinRoomBtnRTC.addEventListener('click', setupAndJoinOrCreateRoom); }
-            audioMove = document.getElementById('audioMove');
-            audioCapture = document.getElementById('audioCapture');
-            audioCheck = document.getElementById('audioCheck');
-            audioWin = document.getElementById('audioWin');
-            audioLose = document.getElementById('audioLose');
-            audioStalemate = document.getElementById('audioStalemate');
             if (prevTrackBtnElement) { prevTrackBtnElement.addEventListener('click', prevRadioTrack); }
             if (playPauseBtnElement) { playPauseBtnElement.addEventListener('click', togglePlayPauseRadio); }
             if (nextTrackBtnElement) { nextTrackBtnElement.addEventListener('click', nextRadioTrack); }
@@ -445,7 +146,7 @@
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.shadowMap.enabled = true;
             renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-            document.body.appendChild(renderer.domElement);
+            if(document.body) { document.body.appendChild(renderer.domElement); } else { console.error("CRITICAL ERROR: document.body not found!"); return; }
 
             setupLighting();
             boardGroup = new THREE.Group();
@@ -457,37 +158,60 @@
             initializeTimers();
             updateMoveTimerDisplay();
 
-            setTimeout(() => {
-                updateDigitalClocks();
-                if (!isGameOverState) {
-                    startPlayerTimer(PlayerColor.WHITE);
-                    startCurrentMoveTimer(PlayerColor.WHITE);
-                }
-            }, 200);
-
+            setTimeout(() => { updateDigitalClocks(); if (!isGameOverState) { startPlayerTimer(PlayerColor.WHITE); startCurrentMoveTimer(PlayerColor.WHITE); } }, 200);
             updateTurnLabel();
             window.addEventListener('resize', onWindowResize, false);
-            renderer.domElement.addEventListener('mousedown', onBoardClick, false);
-            console.log("Initialization sequence complete.");
+            if (renderer && renderer.domElement) { renderer.domElement.addEventListener('mousedown', onBoardClick, false); console.log("onBoardClick listener attached."); } else { console.error("Renderer not available for onBoardClick listener!"); }
+            console.log("Initialization sequence nominally complete.");
             animate();
         }
 
         // --- 3D SETUP AND RENDERING FUNCTIONS ---
-        // ... (These functions: setupLighting, create3DBoardAndBorder, createPieceMesh, createParticles are assumed correct and unchanged)
         function setupLighting() { const ambientLight=new THREE.AmbientLight(0x707070);scene.add(ambientLight);const keyLight=new THREE.DirectionalLight(0xffffff,0.8);keyLight.position.set(-60,100,50);keyLight.castShadow=true;keyLight.shadow.mapSize.width=2048;keyLight.shadow.mapSize.height=2048;const dS=SQUARE_3D_SIZE*BOARD_LOGIC_SIZE;keyLight.shadow.camera.left=-dS;keyLight.shadow.camera.right=dS;keyLight.shadow.camera.top=dS;keyLight.shadow.camera.bottom=-dS;keyLight.shadow.camera.near=30;keyLight.shadow.camera.far=280;keyLight.shadow.bias=-0.0004;scene.add(keyLight);const fillLight=new THREE.DirectionalLight(0x9090A0,0.35);fillLight.position.set(60,70,-40);scene.add(fillLight); }
         function create3DBoardAndBorder(){ const squareGeo=new THREE.BoxGeometry(SQUARE_3D_SIZE,SQUARE_THICKNESS,SQUARE_3D_SIZE);for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const currentSquareMat=((r+c)%2===0?lightSquareMat.clone():darkSquareMat.clone());const squareMesh=new THREE.Mesh(squareGeo,currentSquareMat);squareMesh.position.set((c-(BOARD_LOGIC_SIZE-1)/2.0)*SQUARE_3D_SIZE,-SQUARE_THICKNESS/2.0,(r-(BOARD_LOGIC_SIZE-1)/2.0)*SQUARE_3D_SIZE);squareMesh.receiveShadow=true;squareMesh.userData={type:'square',row:r,col:c,originalMat:currentSquareMat};boardGroup.add(squareMesh);squareMeshes[`r${r}c${c}`]=squareMesh;}}const boardPlayingAreaSize=BOARD_LOGIC_SIZE*SQUARE_3D_SIZE;const borderOuterSize=boardPlayingAreaSize+2*BORDER_WIDTH;const borderGeo=new THREE.BoxGeometry(borderOuterSize,SQUARE_THICKNESS,borderOuterSize);const borderMesh=new THREE.Mesh(borderGeo,borderMat);borderMesh.position.y=-SQUARE_THICKNESS/2.0-0.02; borderMesh.receiveShadow=true;boardGroup.add(borderMesh);}
         function createPieceMesh(pieceLogic){ const material=(pieceLogic.color===PlayerColor.WHITE?whitePieceMat.clone():blackPieceMat.clone());const pieceGroup=new THREE.Group();const R=PIECE_BASE_SCALE;const H_SEG=PIECE_BASE_SCALE*0.45;let mainBody,head,topFeature;switch(pieceLogic.type){case PieceType.PAWN:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.55,R*0.65,H_SEG*1.8,12),material);mainBody.position.y=H_SEG*0.9;head=new THREE.Mesh(new THREE.SphereGeometry(R*0.5,12,8),material);head.position.y=H_SEG*1.8+R*0.45;pieceGroup.add(mainBody,head);break;case PieceType.ROOK:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.7,R*0.7,H_SEG*2.8,12),material);mainBody.position.y=H_SEG*1.4;topFeature=new THREE.Mesh(new THREE.CylinderGeometry(R*0.85,R*0.85,H_SEG*0.7,12),material);topFeature.position.y=H_SEG*2.8+H_SEG*0.35;pieceGroup.add(mainBody,topFeature);break;case PieceType.KNIGHT:const knightBaseG=new THREE.Mesh(new THREE.CylinderGeometry(R*0.7,R*0.8,H_SEG*1.2,12),material);knightBaseG.position.y=H_SEG*0.6;mainBody=new THREE.Mesh(new THREE.BoxGeometry(R*1.0,H_SEG*1.8,R*0.55),material);mainBody.position.y=H_SEG*1.2+H_SEG*0.9;mainBody.rotation.y=Math.PI/16;head=new THREE.Mesh(new THREE.SphereGeometry(R*0.45,12,8),material);head.scale.set(1.1,1.3,0.9);head.position.y=mainBody.position.y+H_SEG*0.9;head.position.x=R*0.35;head.rotation.z=-Math.PI/7;pieceGroup.add(knightBaseG,mainBody,head);break;case PieceType.BISHOP:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.5,R*0.7,H_SEG*2.8,12),material);mainBody.position.y=H_SEG*1.4;head=new THREE.Mesh(new THREE.SphereGeometry(R*0.6,12,8),material);head.position.y=H_SEG*2.8+R*0.5;topFeature=new THREE.Mesh(new THREE.SphereGeometry(R*0.2,8,6),material);topFeature.position.y=head.position.y+R*0.55;topFeature.scale.y=1.6;pieceGroup.add(mainBody,head,topFeature);break;case PieceType.QUEEN:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.6,R*0.8,H_SEG*3.0,12),material);mainBody.position.y=H_SEG*1.5;head=new THREE.Mesh(new THREE.SphereGeometry(R*0.65,12,8),material);head.position.y=H_SEG*3.0+R*0.55;for(let i=0;i<6;i++){const point=new THREE.Mesh(new THREE.ConeGeometry(R*0.1,H_SEG*0.6,6),material);point.position.y=head.position.y+R*0.3+H_SEG*0.3;const angle=i*Math.PI*2/6;point.position.x=Math.cos(angle)*R*0.5;point.position.z=Math.sin(angle)*R*0.5;point.rotation.x=Math.PI/16;pieceGroup.add(point);}pieceGroup.add(mainBody,head);break;case PieceType.KING:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.7,R*0.9,H_SEG*3.3,12),material);mainBody.position.y=H_SEG*1.65;const crossBase=new THREE.Mesh(new THREE.CylinderGeometry(R*0.3,R*0.3,H_SEG*0.3,8),material);crossBase.position.y=H_SEG*3.3+H_SEG*0.15;topFeature=new THREE.Mesh(new THREE.BoxGeometry(R*0.12,H_SEG*0.6,R*0.12),material);topFeature.position.y=crossBase.position.y+H_SEG*0.3+H_SEG*0.3;const crossArm=new THREE.Mesh(new THREE.BoxGeometry(H_SEG*0.5,R*0.12,R*0.12),material);crossArm.position.y=topFeature.position.y-H_SEG*0.05;pieceGroup.add(mainBody,crossBase,topFeature,crossArm);break;default: const errGeo=new THREE.BoxGeometry(R,R,R); const errMesh = new THREE.Mesh(errGeo, new THREE.MeshBasicMaterial({color:0xff0000})); pieceGroup.add(errMesh); break;} return pieceGroup;}
         function createParticles(count){if(count===0){return;}const positions=[];const particleMaterial=new THREE.PointsMaterial({color:0xffffff,size:0.07,sizeAttenuation:true,transparent:true,opacity:0.4,blending:THREE.AdditiveBlending,depthWrite:false});const particleAnimationSpread=SQUARE_3D_SIZE*BOARD_LOGIC_SIZE*3.0; const particleZResetMax=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+3000; const particleZResetMin=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+200; for(let i=0;i<count;i++){const x=(Math.random()-0.5)*particleAnimationSpread;const y=(Math.random()-0.5)*particleAnimationSpread*0.6;const z=particleZResetMin+Math.random()*(particleZResetMax-particleZResetMin);positions.push(x,y,z);}const particleGeometry=new THREE.BufferGeometry();particleGeometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));particlesPoints=new THREE.Points(particleGeometry,particleMaterial);scene.add(particlesPoints);}
 
         // --- CHESS LOGIC FUNCTIONS ---
-        // ... (These functions: initializeBoardLogicStandard, getOpponent, isPathClear, isValidMove, refresh3DPieceDisplay,
-        //     makeMoveLogic, switchPlayer, isKingCaptured, initializeTimers, formatTime, updateDigitalClocks,
-        //     startPlayerTimer, stopPlayerTimer, pressClockButton, onBoardClick, AI logic, animateParticles, animate
-        //     are assumed correct and unchanged from the previous fully working version before WebRTC integration)
         function initializeBoardLogicStandard(){ for(let r=0; r<BOARD_LOGIC_SIZE; r++) for(let c=0; c<BOARD_LOGIC_SIZE; c++) boardLogic[r][c] = new Piece(PieceType.EMPTY, PlayerColor.NONE); const P = PieceType, C = PlayerColor; boardLogic[0][0]=new Piece(P.ROOK,C.BLACK); boardLogic[0][1]=new Piece(P.KNIGHT,C.BLACK); boardLogic[0][2]=new Piece(P.BISHOP,C.BLACK); boardLogic[0][3]=new Piece(P.QUEEN,C.BLACK); boardLogic[0][4]=new Piece(P.KING,C.BLACK); boardLogic[0][5]=new Piece(P.BISHOP,C.BLACK); boardLogic[0][6]=new Piece(P.KNIGHT,C.BLACK); boardLogic[0][7]=new Piece(P.ROOK,C.BLACK); for(let c=0;c<8;c++) boardLogic[1][c]=new Piece(P.PAWN,C.BLACK); for(let c=0;c<8;c++) boardLogic[6][c]=new Piece(P.PAWN,C.WHITE); boardLogic[7][0]=new Piece(P.ROOK,C.WHITE); boardLogic[7][1]=new Piece(P.KNIGHT,C.WHITE); boardLogic[7][2]=new Piece(P.BISHOP,C.WHITE); boardLogic[7][3]=new Piece(P.QUEEN,C.WHITE); boardLogic[7][4]=new Piece(P.KING,C.WHITE); boardLogic[7][5]=new Piece(P.BISHOP,C.WHITE); boardLogic[7][6]=new Piece(P.KNIGHT,C.WHITE); boardLogic[7][7]=new Piece(P.ROOK,C.WHITE); currentPlayer = C.WHITE;}
         function getOpponent(player){return player===PlayerColor.WHITE?PlayerColor.BLACK:PlayerColor.WHITE;}
         function isPathClear(startR,startC,endR,endC,boardState=boardLogic){const stepR=Math.sign(endR-startR);const stepC=Math.sign(endC-startC);let currentR=startR+stepR;let currentC=startC+stepC;while(currentR!==endR||currentC!==endC){if(boardState[currentR][currentC].type!==PieceType.EMPTY)return false;currentR+=stepR;currentC+=stepC;}return true;}
-        function isValidMove(startR,startC,endR,endC,piece,playerColor,boardState=boardLogic,checkKingSafety=true){if(!piece || piece.type === PieceType.EMPTY) return false; if(startR<0||startR>=BOARD_LOGIC_SIZE||startC<0||startC>=BOARD_LOGIC_SIZE||endR<0||endR>=BOARD_LOGIC_SIZE||endC<0||endC>=BOARD_LOGIC_SIZE)return false;if(startR===endR&&startC===endC)return false;const targetPiece=boardState[endR][endC];if(targetPiece.type!==PieceType.EMPTY&&targetPiece.color===playerColor)return false;const dR=endR-startR;const dC=endC-startC;let validBasicMove=false;switch(piece.type){case PieceType.PAWN:const dir=(playerColor===PlayerColor.WHITE)?-1:1;if(dC===0&&dR===dir&&targetPiece.type===PieceType.EMPTY)validBasicMove=true;if(dC===0&&dR===2*dir&&targetPiece.type===PieceType.EMPTY&&!piece.hasMoved&&boardState[startR+dir][startC].type===PieceType.EMPTY)validBasicMove=true;if(Math.abs(dC)===1&&dR===dir&&targetPiece.type!==PieceType.EMPTY&&targetPiece.color!==playerColor)validBasicMove=true;break;case PieceType.ROOK:if(dR===0||dC===0)validBasicMove=isPathClear(startR,startC,endR,endC,boardState);break;case PieceType.BISHOP:if(Math.abs(dR)===Math.abs(dC))validBasicMove=isPathClear(startR,startC,endR,endC,boardState);break;case PieceType.QUEEN:if(dR===0||dC===0||Math.abs(dR)===Math.abs(dC))validBasicMove=isPathClear(startR,startC,endR,endC,boardState);break;case PieceType.KING:validBasicMove=(Math.abs(dR)<=1&&Math.abs(dC)<=1);break;case PieceType.KNIGHT:validBasicMove=((Math.abs(dR)===2&&Math.abs(dC)===1)||(Math.abs(dR)===1&&Math.abs(dC)===2));break;default:return false;}if(!validBasicMove)return false;if(checkKingSafety){const tempBoard=applyMoveToBoardCopy(boardState,{start:{row:startR,col:startC},end:{row:endR,col:endC}});if(isKingInCheck(tempBoard,playerColor))return false;}return true;}
+
+        function isValidMove(startR, startC, endR, endC, piece, playerColor, boardState = boardLogic, checkKingSafety = true) {
+            console.log(`isValidMove: Checking from (${startR},${startC}) to (${endR},${endC}) for ${Object.keys(PieceType).find(k=>PieceType[k]===piece.type)} color ${playerColor}`);
+            if (!piece || piece.type === PieceType.EMPTY) { console.log("isValidMove: No piece or empty piece."); return false; }
+            if (startR < 0 || startR >= BOARD_LOGIC_SIZE || startC < 0 || startC >= BOARD_LOGIC_SIZE || endR < 0 || endR >= BOARD_LOGIC_SIZE || endC < 0 || endC >= BOARD_LOGIC_SIZE) { console.log("isValidMove: Move out of bounds."); return false; }
+            if (startR === endR && startC === endC) { console.log("isValidMove: Start and end are same."); return false; }
+            const targetPiece = boardState[endR][endC];
+            console.log(`isValidMove: Target piece at (${endR},${endC}) is type ${Object.keys(PieceType).find(k=>PieceType[k]===targetPiece.type)}, color ${targetPiece.color}`);
+            if (targetPiece.type !== PieceType.EMPTY && targetPiece.color === playerColor) { console.log("isValidMove: Cannot capture own piece."); return false; }
+            const dR = endR - startR; const dC = endC - startC; let validBasicMove = false;
+            switch (piece.type) {
+                case PieceType.PAWN:
+                    const dir = (playerColor === PlayerColor.WHITE) ? -1 : 1;
+                    console.log(`isValidMove PAWN: dir=${dir}, dR=${dR}, dC=${dC}, piece.hasMoved=${piece.hasMoved}, targetPieceType=${targetPiece.type}`);
+                    if (dC === 0 && dR === dir && targetPiece.type === PieceType.EMPTY) { validBasicMove = true; console.log("isValidMove PAWN: Condition MET - one step forward."); }
+                    else if (dC === 0 && dR === (2 * dir) && targetPiece.type === PieceType.EMPTY && !piece.hasMoved && boardState[startR + dir][startC].type === PieceType.EMPTY) { validBasicMove = true; console.log("isValidMove PAWN: Condition MET - two steps forward."); }
+                    else if (Math.abs(dC) === 1 && dR === dir && targetPiece.type !== PieceType.EMPTY && targetPiece.color !== playerColor) { validBasicMove = true; console.log("isValidMove PAWN: Condition MET - capture."); }
+                    else { console.log("isValidMove PAWN: NO valid pawn move condition met."); }
+                    break;
+                case PieceType.ROOK: if (dR === 0 || dC === 0) {validBasicMove = isPathClear(startR, startC, endR, endC, boardState); console.log("isValidMove ROOK: Path clear?", validBasicMove)} else console.log("isValidMove ROOK: Not straight line"); break;
+                case PieceType.BISHOP: if (Math.abs(dR) === Math.abs(dC)) {validBasicMove = isPathClear(startR, startC, endR, endC, boardState); console.log("isValidMove BISHOP: Path clear?", validBasicMove)} else console.log("isValidMove BISHOP: Not diagonal"); break;
+                case PieceType.QUEEN: if (dR === 0 || dC === 0 || Math.abs(dR) === Math.abs(dC)) {validBasicMove = isPathClear(startR, startC, endR, endC, boardState); console.log("isValidMove QUEEN: Path clear?", validBasicMove)} else console.log("isValidMove QUEEN: Not straight/diag"); break;
+                case PieceType.KING: validBasicMove = (Math.abs(dR) <= 1 && Math.abs(dC) <= 1); console.log("isValidMove KING: Basic move valid?", validBasicMove); break;
+                case PieceType.KNIGHT: validBasicMove = ((Math.abs(dR) === 2 && Math.abs(dC) === 1) || (Math.abs(dR) === 1 && Math.abs(dC) === 2)); console.log("isValidMove KNIGHT: Basic move valid?", validBasicMove); break;
+                default: console.log("isValidMove: Unknown piece type."); return false;
+            }
+            if (!validBasicMove) { console.log("isValidMove: Basic move is NOT valid."); return false; }
+            console.log("isValidMove: Basic move IS valid. Checking king safety...");
+            if (checkKingSafety) {
+                const tempBoard = applyMoveToBoardCopy(boardState, { start: { row: startR, col: startC }, end: { row: endR, col: endC } });
+                if (isKingInCheck(tempBoard, playerColor)) { console.log("isValidMove: Move puts own king in check. INVALID."); return false; }
+                console.log("isValidMove: King is safe after this move.");
+            }
+            console.log("isValidMove: Returning TRUE."); return true;
+        }
+
         function refresh3DPieceDisplay(highlightingMoves = false){if (!highlightingMoves) { Object.values(pieceMeshes).forEach(meshGroup=>{ if(meshGroup.parent) meshGroup.parent.remove(meshGroup); meshGroup.traverse(child=>{if(child.isMesh){if(child.geometry)child.geometry.dispose();if(child.material){if(Array.isArray(child.material)){child.material.forEach(mat=>mat.dispose());}else{child.material.dispose();}}}}); });pieceMeshes={};for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const pL=boardLogic[r][c];if(pL.type!==PieceType.EMPTY){const p3DG=createPieceMesh(pL);if(p3DG){p3DG.position.set((c-(BOARD_LOGIC_SIZE-1)/2.0)*SQUARE_3D_SIZE,0.01,(r-(BOARD_LOGIC_SIZE-1)/2.0)*SQUARE_3D_SIZE);p3DG.userData={type:'piece',row:r,col:c,piece:pL};p3DG.traverse(ch=>{if(ch.isMesh){ch.castShadow=true;ch.receiveShadow=true;}});boardGroup.add(p3DG);pieceMeshes[`r${r}c${c}`]=p3DG;} }}}}Object.values(squareMeshes).forEach(sq=>{ if(sq.userData.originalMat) sq.material = sq.userData.originalMat.clone(); });if(selectedPieceInfo && selectedPieceInfo.pieceLogic && squareMeshes[`r${selectedPieceInfo.row}c${selectedPieceInfo.col}`]){squareMeshes[`r${selectedPieceInfo.row}c${selectedPieceInfo.col}`].material = highlightMat.clone();const piece = selectedPieceInfo.pieceLogic; const rStart = selectedPieceInfo.row; const cStart = selectedPieceInfo.col;for (let rEnd = 0; rEnd < BOARD_LOGIC_SIZE; rEnd++) {for (let cEnd = 0; cEnd < BOARD_LOGIC_SIZE; cEnd++) {if (isValidMove(rStart, cStart, rEnd, cEnd, piece, currentPlayer, boardLogic, true)) {const squareKey = `r${rEnd}c${cEnd}`;if (squareMeshes[squareKey] && squareMeshes[squareKey] !== squareMeshes[`r${selectedPieceInfo.row}c${selectedPieceInfo.col}`]) {squareMeshes[squareKey].material = validMoveMat.clone();}}}}}}
         function makeMoveLogic(startR,startC,endR,endC){const movingPiece=boardLogic[startR][startC].clone();const originalTargetPiece = boardLogic[endR][endC].clone();if(movingPiece.type===PieceType.PAWN){if((movingPiece.color===PlayerColor.WHITE&&endR===0)||(movingPiece.color===PlayerColor.BLACK&&endR===BOARD_LOGIC_SIZE-1)){movingPiece.type=PieceType.QUEEN;setMessage("Pawn promoted!");}}boardLogic[endR][endC]=movingPiece;boardLogic[startR][startC]=new Piece(PieceType.EMPTY,PlayerColor.NONE);boardLogic[endR][endC].hasMoved=true;if (originalTargetPiece.type !== PieceType.EMPTY) {playSound(audioCapture);} else {playSound(audioMove);}}
         function switchPlayer(){stopCurrentMoveTimer();currentPlayer=getOpponent(currentPlayer);updateTurnLabel();isPlayerTurn=(currentPlayer===PlayerColor.WHITE);if(isGameOverState)isPlayerTurn=false;else startCurrentMoveTimer(currentPlayer);}
@@ -497,13 +221,124 @@
         function updateDigitalClocks(){const whiteTimeStr=formatTime(Math.max(0,timerWhite));const blackTimeStr=formatTime(Math.max(0,timerBlack));if(whiteTimerDisplayElement)whiteTimerDisplayElement.textContent=`W: ${whiteTimeStr}`;if(blackTimerDisplayElement)blackTimerDisplayElement.textContent=`B: ${blackTimeStr}`;}
         function startPlayerTimer(playerColor){if(isGameOverState)return;if(gameTimerInterval)clearInterval(gameTimerInterval);activeTimerSide=playerColor;gameTimerInterval=setInterval(()=>{if(isGameOverState){clearInterval(gameTimerInterval);return;}if(activeTimerSide===PlayerColor.WHITE){timerWhite--;if(timerWhite<0){timerWhite=0;clearInterval(gameTimerInterval);setMessage("WHITE's time is up! BLACK wins!");isGameOverState=true;isPlayerTurn=false; playSound(audioLose);}}else if(activeTimerSide===PlayerColor.BLACK){timerBlack--;if(timerBlack<0){timerBlack=0;clearInterval(gameTimerInterval);setMessage("BLACK's time is up! WHITE wins!");isGameOverState=true;isPlayerTurn=false; playSound(audioWin);}}updateDigitalClocks();},1000);}
         function stopPlayerTimer(){if(gameTimerInterval)clearInterval(gameTimerInterval);activeTimerSide=null;}
-        function pressClockButton(playerWhoJustMoved) {if(isGameOverState){stopPlayerTimer();return;}stopPlayerTimer();const nextPlayerToStartTimer=getOpponent(playerWhoJustMoved);startPlayerTimer(nextPlayerToStartTimer);updateDigitalClocks();}
-        function onBoardClick(event){if(isGameOverState || !isPlayerTurn ){ return; }event.preventDefault(); setMessage("");const mouse=new THREE.Vector2((event.clientX/renderer.domElement.clientWidth)*2-1,-(event.clientY/renderer.domElement.clientHeight)*2+1);const raycaster=new THREE.Raycaster(); raycaster.setFromCamera(mouse,camera);const intersectableObjects = [...boardGroup.children]; const intersects=raycaster.intersectObjects(intersectableObjects,true);if (intersects.length > 0) {let clickedUserData = null;for (let i = 0; i < intersects.length; i++) {let obj = intersects[i].object;while (obj.parent && obj.parent !== scene && !(obj.userData && obj.userData.type)) { obj = obj.parent; }if (obj.userData && (obj.userData.type === 'square' || obj.userData.type === 'piece')) {clickedUserData = obj.userData; break;}}if (clickedUserData) {if (currentPlayer !== PlayerColor.WHITE || !isPlayerTurn) {setMessage("Wait for your turn or AI move.");return;}const r = clickedUserData.row; const c = clickedUserData.col;if (selectedPieceInfo === null) {if (boardLogic[r][c].type !== PieceType.EMPTY && boardLogic[r][c].color === currentPlayer) {selectedPieceInfo = { pieceLogic: boardLogic[r][c], row: r, col: c };refresh3DPieceDisplay(true);} else if (boardLogic[r][c].type !== PieceType.EMPTY) {setMessage("Not your piece!"); refresh3DPieceDisplay();} else {refresh3DPieceDisplay();}} else {if (isValidMove(selectedPieceInfo.row, selectedPieceInfo.col, r, c, selectedPieceInfo.pieceLogic, currentPlayer, boardLogic, true)) {const playerWhoMoved = currentPlayer;makeMoveLogic(selectedPieceInfo.row, selectedPieceInfo.col, r, c);const opponentColor = getOpponent(currentPlayer);if (isKingInCheck(boardLogic, opponentColor)) { playSound(audioCheck); setMessage("Check!"); }if (isKingCaptured(boardLogic, opponentColor)) {setMessage((Object.keys(PlayerColor).find(k => PlayerColor[k] === currentPlayer) || "Player") + " WINS!");isGameOverState = true; isPlayerTurn = false; stopPlayerTimer(); stopCurrentMoveTimer(); updateDigitalClocks();if (currentPlayer === PlayerColor.WHITE) playSound(audioWin); else playSound(audioLose);selectedPieceInfo = null; refresh3DPieceDisplay(); return;}if (isGameOver(boardLogic, opponentColor)) {isGameOverState = true; isPlayerTurn = false; stopPlayerTimer(); stopCurrentMoveTimer(); updateDigitalClocks();selectedPieceInfo = null; refresh3DPieceDisplay(); return;}switchPlayer();pressClockButton(playerWhoMoved);selectedPieceInfo = null;refresh3DPieceDisplay();if (currentPlayer === PlayerColor.BLACK && !isGameOverState) {makeAIMove();}} else {if (boardLogic[r][c].type !== PieceType.EMPTY && boardLogic[r][c].color === currentPlayer) {selectedPieceInfo = { pieceLogic: boardLogic[r][c], row: r, col: c };refresh3DPieceDisplay(true);} else {setMessage("Invalid move for " + (Object.keys(PieceType).find(k => PieceType[k] === selectedPieceInfo.pieceLogic.type) || "Piece"));selectedPieceInfo = null; refresh3DPieceDisplay();}}}}} else {selectedPieceInfo = null; refresh3DPieceDisplay();}}
-        const AI_SEARCH_DEPTH = 2;const pieceValues = { [PieceType.PAWN]: 100, [PieceType.KNIGHT]: 320, [PieceType.BISHOP]: 330, [PieceType.ROOK]: 500, [PieceType.QUEEN]: 900, [PieceType.KING]: 20000 };const pawnTable = [[0,0,0,0,0,0,0,0],[50,50,50,50,50,50,50,50],[10,10,20,30,30,20,10,10],[5,5,10,25,25,10,5,5],[0,0,0,20,20,0,0,0],[5,-5,-10,0,0,-10,-5,5],[5,10,10,-20,-20,10,10,5],[0,0,0,0,0,0,0,0]];function evaluateBoard(board){let score=0;for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const piece=board[r][c];if(piece.type!==PieceType.EMPTY){let value=pieceValues[piece.type]||0;if(piece.type===PieceType.PAWN){value+=(piece.color===PlayerColor.WHITE)?pawnTable[r][c]:pawnTable[7-r][c];}if(piece.color===PlayerColor.WHITE){score+=value;}else{score-=value;}}}}return score;}function generateAllPossibleMoves(currentBoard,player){const moves=[];for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){if(currentBoard[r][c].color===player){const piece = currentBoard[r][c]; if(piece.type === PieceType.EMPTY) continue; for(let tr=0;tr<BOARD_LOGIC_SIZE;tr++){for(let tc=0;tc<BOARD_LOGIC_SIZE;tc++){if(isValidMove(r,c,tr,tc,piece,player,currentBoard,false)){const tempBoardAfterMove=applyMoveToBoardCopy(currentBoard,{start:{row:r,col:c},end:{row:tr,col:tc}});if(!isKingInCheck(tempBoardAfterMove,player)){moves.push({start:{row:r,col:c},end:{row:tr,col:tc}});}}}}}}}return moves;}function applyMoveToBoardCopy(originalBoard,move){const newBoard=originalBoard.map(row=>row.map(p=>p.clone()));const pieceToMove=newBoard[move.start.row][move.start.col];if(pieceToMove.type===PieceType.PAWN){if((pieceToMove.color===PlayerColor.WHITE&&move.end.row===0)||(pieceToMove.color===PlayerColor.BLACK&&move.end.row===BOARD_LOGIC_SIZE-1)){pieceToMove.type=PieceType.QUEEN;}}newBoard[move.end.row][move.end.col]=pieceToMove;newBoard[move.start.row][move.start.col]=new Piece(PieceType.EMPTY,PlayerColor.NONE);if(newBoard[move.end.row][move.end.col].type!==PieceType.EMPTY){newBoard[move.end.row][move.end.col].hasMoved=true;}return newBoard;}function isKingInCheck(boardState,playerColor){let kingR=-1,kingC=-1;for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){if(boardState[r][c].type===PieceType.KING&&boardState[r][c].color===playerColor){kingR=r;kingC=c;break;}}if(kingR===-1)return true;}const opponentColor=getOpponent(playerColor);for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const piece=boardState[r][c];if(piece.color===opponentColor && piece.type !== PieceType.EMPTY){if(isValidMove(r,c,kingR,kingC,piece,opponentColor,boardState,false)){return true;}}}}return false;}function isGameOver(boardState,playerToMove){const possibleMoves=generateAllPossibleMoves(boardState,playerToMove);if(possibleMoves.length===0){if(isKingInCheck(boardState,playerToMove)){const winnerName=Object.keys(PlayerColor).find(k=>PlayerColor[k]===getOpponent(playerToMove))||"Opponent";setMessage(winnerName+" WINS by Checkmate!");if(getOpponent(playerToMove)===PlayerColor.WHITE) playSound(audioWin); else playSound(audioLose);return true;}else{setMessage("STALEMATE!");playSound(audioStalemate);return true;}}return false;}function minimax(board,depth,player,alpha,beta,isMaximizingWhite){if(depth===0||isGameOver(board,player)){return evaluateBoard(board);}const possibleMoves=generateAllPossibleMoves(board,player);if(possibleMoves.length===0){return isKingInCheck(board,player)?(isMaximizingWhite?-Infinity:Infinity):0;}if(isMaximizingWhite){let maxEval=-Infinity;for(const move of possibleMoves){const tempBoard=applyMoveToBoardCopy(board,move);const currentEval=minimax(tempBoard,depth-1,getOpponent(player),alpha,beta,false);maxEval=Math.max(maxEval,currentEval);alpha=Math.max(alpha,currentEval);if(beta<=alpha)break;}return maxEval;}else{let minEval=Infinity;for(const move of possibleMoves){const tempBoard=applyMoveToBoardCopy(board,move);const currentEval=minimax(tempBoard,depth-1,getOpponent(player),alpha,beta,true);minEval=Math.min(minEval,currentEval);beta=Math.min(beta,currentEval);if(beta<=alpha)break;}return minEval;}}function findBestMoveMinimax(currentBoardState,player,depth){let bestMove=null;let bestScore;const possibleMoves=generateAllPossibleMoves(currentBoardState,player);if(possibleMoves.length===0){return null;}let topMovesForDisplay = [];if(player===PlayerColor.WHITE){bestScore=-Infinity;for(const move of possibleMoves){const piece = currentBoardState[move.start.row][move.start.col]; if(piece.type === PieceType.EMPTY) continue; const tempBoard=applyMoveToBoardCopy(currentBoardState,move);const score=minimax(tempBoard,depth-1,getOpponent(player),-Infinity,Infinity,false);topMovesForDisplay.push({move:move, score:score, piece:piece});if(score>bestScore){bestScore=score;bestMove={...move,piece:piece.clone(),score:score};}}}else{bestScore=Infinity;for(const move of possibleMoves){const piece = currentBoardState[move.start.row][move.start.col]; if(piece.type === PieceType.EMPTY) continue; const tempBoard=applyMoveToBoardCopy(currentBoardState,move);const score=minimax(tempBoard,depth-1,getOpponent(player),-Infinity,Infinity,true);topMovesForDisplay.push({move:move, score:score, piece:piece});if(score<bestScore){bestScore=score;bestMove={...move,piece:piece.clone(),score:score};}}}if(player===PlayerColor.BLACK)topMovesForDisplay.sort((a,b)=>a.score-b.score);else topMovesForDisplay.sort((a,b)=>b.score-a.score);displayTopMoves(topMovesForDisplay.slice(0,3));if(!bestMove&&possibleMoves.length>0){const firstValidMove = possibleMoves[0]; bestMove={...firstValidMove,piece:currentBoardState[firstValidMove.start.row][firstValidMove.start.col].clone(),score:bestScore};}return bestMove;}function makeAIMove(){if(isGameOverState||currentPlayer!==PlayerColor.BLACK)return;setMessage("AI calculating...");setTimeout(()=>{if(isGameOverState){isPlayerTurn=(currentPlayer===PlayerColor.WHITE);return;}const bestMove=findBestMoveMinimax(boardLogic,PlayerColor.BLACK,AI_SEARCH_DEPTH);if(bestMove && bestMove.piece){const playerWhoMoved = currentPlayer;makeMoveLogic(bestMove.start.row,bestMove.start.col,bestMove.end.row,bestMove.end.col);refresh3DPieceDisplay();const pieceMovedName=Object.keys(PieceType).find(k=>PieceType[k]===bestMove.piece.type)||"Piece";setMessage(`AI moved ${pieceMovedName}.`);if(isKingInCheck(boardLogic,PlayerColor.WHITE)){playSound(audioCheck);setMessage(`AI moved ${pieceMovedName}. Check!`);}if(isKingCaptured(boardLogic,PlayerColor.WHITE)){setMessage("BLACK WINS!");isGameOverState=true;stopPlayerTimer();stopCurrentMoveTimer();updateDigitalClocks();playSound(audioWin);return;}if(isGameOver(boardLogic,PlayerColor.WHITE)){isGameOverState=true;stopPlayerTimer();stopCurrentMoveTimer();updateDigitalClocks();return;}switchPlayer();if(!isGameOverState){pressClockButton(playerWhoMoved);}}else{setMessage("AI has no valid moves or error.");if(!isGameOver(boardLogic,PlayerColor.BLACK)){isGameOverState=true;}stopPlayerTimer();stopCurrentMoveTimer();}updateDigitalClocks();},700);}function displayTopMoves(moves){if(!aiTrainerPanelElement||!topMovesListElement)return;if(moves&&moves.length>0){aiTrainerPanelElement.style.display='block';topMovesListElement.innerHTML='';moves.forEach((m,index)=>{if(!m.piece) return; const pieceName=Object.keys(PieceType).find(k=>PieceType[k]===m.piece.type)||"P";const moveStr=`${pieceName[0]}: ${String.fromCharCode(97+m.move.start.col)}${8-m.move.start.row} -> ${String.fromCharCode(97+m.move.end.col)}${8-m.move.end.row}`;const scoreStr=`(Eval: ${m.score.toFixed(1)})`;topMovesListElement.innerHTML+=`<div>${index+1}. ${moveStr} ${scoreStr}</div>`;});}else{aiTrainerPanelElement.style.display='none';}}
-        function animateParticles(){if(!particlesPoints||!particlesPoints.geometry||PARTICLE_COUNT===0)return;const positions=particlesPoints.geometry.attributes.position.array;const numParticles=positions.length/3;const particleAnimationSpread=SQUARE_3D_SIZE*BOARD_LOGIC_SIZE*3.0; const particleZResetMax=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+3000; const particleZResetMin=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+200; for(let i=0;i<numParticles;i++){const i3=i*3;positions[i3+0]+=(Math.random()-0.5)*0.06;positions[i3+1]+=(Math.random()-0.5)*0.06;positions[i3+2]+=(Math.random()-0.5)*0.02;if(Math.abs(positions[i3+0])>particleAnimationSpread*1.2)positions[i3+0]*=-0.999;if(Math.abs(positions[i3+1])>particleAnimationSpread*0.7)positions[i3+1]*=-0.999;if(positions[i3+2]>particleZResetMax||positions[i3+2]<particleZResetMin){positions[i3+2]=particleZResetMin+Math.random()*(particleZResetMax-particleZResetMin-100);}}particlesPoints.geometry.attributes.position.needsUpdate=true;}
-        function animate(time){requestAnimationFrame(animate);if(particlesPoints) animateParticles();renderer.render(scene,camera);}
+        function pressClockButton(playerWhoJustMoved) {console.log("pressClockButton called for player:", playerWhoJustMoved); if(isGameOverState){stopPlayerTimer();return;}stopPlayerTimer();const nextPlayerToStartTimer=getOpponent(playerWhoJustMoved);startPlayerTimer(nextPlayerToStartTimer);updateDigitalClocks();}
+        
+        // onBoardClick with DETAILED LOGGING
+        function onBoardClick(event){
+            console.log("onBoardClick triggered. isPlayerTurn:", isPlayerTurn, "currentPlayer:", currentPlayer);
+            if(isGameOverState || !isPlayerTurn ){ console.log("onBoardClick: Game over or not player's turn. Returning."); return; }
+            event.preventDefault();
+            setMessage("");
 
-        init();
+            const mouse=new THREE.Vector2((event.clientX/renderer.domElement.clientWidth)*2-1,-(event.clientY/renderer.domElement.clientHeight)*2+1);
+            const raycaster=new THREE.Raycaster(); raycaster.setFromCamera(mouse,camera);
+            const intersectableObjects = [...boardGroup.children];
+            const intersects=raycaster.intersectObjects(intersectableObjects,true);
+            console.log("Intersects found:", intersects.length);
+
+            if (intersects.length > 0) {
+                let clickedUserData = null;
+                for (let i = 0; i < intersects.length; i++) {
+                    let obj = intersects[i].object;
+                    while (obj.parent && obj.parent !== scene && !(obj.userData && obj.userData.type)) { obj = obj.parent; }
+                    if (obj.userData && (obj.userData.type === 'square' || obj.userData.type === 'piece')) {
+                        clickedUserData = obj.userData; console.log("Clicked userData:", clickedUserData); break;
+                    }
+                }
+                if (clickedUserData) {
+                    if (currentPlayer !== PlayerColor.WHITE || !isPlayerTurn) { setMessage("Wait for your turn or AI move."); console.log("Clicked, but not human white's turn."); return; }
+                    const r = clickedUserData.row; const c = clickedUserData.col;
+                    console.log(`Clicked on board: r=${r}, c=${c}`);
+                    if (selectedPieceInfo === null) {
+                        console.log("No piece selected. Attempting to select.");
+                        if (boardLogic[r][c].type !== PieceType.EMPTY && boardLogic[r][c].color === currentPlayer) {
+                            selectedPieceInfo = { pieceLogic: boardLogic[r][c].clone(), row: r, col: c };
+                            console.log("Selected piece:", selectedPieceInfo);
+                            refresh3DPieceDisplay(true);
+                        } else if (boardLogic[r][c].type !== PieceType.EMPTY) {
+                            setMessage("Not your piece!"); console.log("Clicked on opponent's piece or empty when trying to select.");
+                            refresh3DPieceDisplay();
+                        } else {
+                            console.log("Clicked on empty square, no piece selected.");
+                            refresh3DPieceDisplay();
+                        }
+                    } else {
+                        console.log("Piece already selected:", selectedPieceInfo, "Attempting to move to r=", r, "c=", c);
+                        if (isValidMove(selectedPieceInfo.row, selectedPieceInfo.col, r, c, selectedPieceInfo.pieceLogic, currentPlayer, boardLogic, true)) {
+                            console.log("Move is valid. Making move.");
+                            const playerWhoMoved = currentPlayer;
+                            makeMoveLogic(selectedPieceInfo.row, selectedPieceInfo.col, r, c);
+                            const opponentColor = getOpponent(currentPlayer);
+                            if (isKingInCheck(boardLogic, opponentColor)) { playSound(audioCheck); setMessage("Check!"); console.log("Check!");}
+                            if (isKingCaptured(boardLogic, opponentColor)) {setMessage((Object.keys(PlayerColor).find(k => PlayerColor[k] === currentPlayer) || "Player") + " WINS!");isGameOverState = true; isPlayerTurn = false; stopPlayerTimer(); stopCurrentMoveTimer(); updateDigitalClocks();if (currentPlayer === PlayerColor.WHITE) playSound(audioWin); else playSound(audioLose);selectedPieceInfo = null; refresh3DPieceDisplay(); console.log("King captured, game over."); return;}
+                            if (isGameOver(boardLogic, opponentColor)) {isGameOverState = true; isPlayerTurn = false; stopPlayerTimer(); stopCurrentMoveTimer(); updateDigitalClocks();selectedPieceInfo = null; refresh3DPieceDisplay(); console.log("Game over (checkmate/stalemate)."); return;}
+                            switchPlayer(); pressClockButton(playerWhoMoved); selectedPieceInfo = null; refresh3DPieceDisplay();
+                            console.log("Move made. Switched player. Current player:", currentPlayer);
+                            if (currentPlayer === PlayerColor.BLACK && !isGameOverState) { console.log("Triggering AI move."); makeAIMove(); }
+                        } else {
+                             console.log("Move is invalid (returned by isValidMove).");
+                            if (boardLogic[r][c].type !== PieceType.EMPTY && boardLogic[r][c].color === currentPlayer) {
+                                selectedPieceInfo = { pieceLogic: boardLogic[r][c].clone(), row: r, col: c };
+                                console.log("Selected another of own pieces:", selectedPieceInfo);
+                                refresh3DPieceDisplay(true);
+                            } else {
+                                const pieceName = selectedPieceInfo.pieceLogic ? (Object.keys(PieceType).find(k=>PieceType[k]===selectedPieceInfo.pieceLogic.type)||"Piece") : "Unknown Piece";
+                                setMessage("Invalid move for " + pieceName);
+                                console.log("Invalid move for " + pieceName + ". Deselecting.");
+                                selectedPieceInfo = null; refresh3DPieceDisplay();
+                            }
+                        }
+                    }
+                } else { console.log("Clicked, but no valid game object userData found in intersects."); }
+            } else { console.log("Clicked outside board. Deselecting."); selectedPieceInfo = null; refresh3DPieceDisplay(); }
+        }
+
+        // --- AI LOGIC ---
+        const AI_SEARCH_DEPTH = 2;const pieceValues = { [PieceType.PAWN]: 100, [PieceType.KNIGHT]: 320, [PieceType.BISHOP]: 330, [PieceType.ROOK]: 500, [PieceType.QUEEN]: 900, [PieceType.KING]: 20000 };const pawnTable = [[0,0,0,0,0,0,0,0],[50,50,50,50,50,50,50,50],[10,10,20,30,30,20,10,10],[5,5,10,25,25,10,5,5],[0,0,0,20,20,0,0,0],[5,-5,-10,0,0,-10,-5,5],[5,10,10,-20,-20,10,10,5],[0,0,0,0,0,0,0,0]];function evaluateBoard(board){let score=0;for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const piece=board[r][c];if(piece.type!==PieceType.EMPTY){let value=pieceValues[piece.type]||0;if(piece.type===PieceType.PAWN){value+=(piece.color===PlayerColor.WHITE)?pawnTable[r][c]:pawnTable[7-r][c];}if(piece.color===PlayerColor.WHITE){score+=value;}else{score-=value;}}}}return score;}function generateAllPossibleMoves(currentBoard,player){const moves=[];for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){if(currentBoard[r][c].color===player){const piece = currentBoard[r][c]; if(piece.type === PieceType.EMPTY) continue; for(let tr=0;tr<BOARD_LOGIC_SIZE;tr++){for(let tc=0;tc<BOARD_LOGIC_SIZE;tc++){if(isValidMove(r,c,tr,tc,piece,player,currentBoard,false)){const tempBoardAfterMove=applyMoveToBoardCopy(currentBoard,{start:{row:r,col:c},end:{row:tr,col:tc}});if(!isKingInCheck(tempBoardAfterMove,player)){moves.push({start:{row:r,col:c},end:{row:tr,col:tc}});}}}}}}}return moves;}function applyMoveToBoardCopy(originalBoard,move){const newBoard=originalBoard.map(row=>row.map(p=>p.clone()));const pieceToMove=newBoard[move.start.row][move.start.col];if(pieceToMove.type===PieceType.PAWN){if((pieceToMove.color===PlayerColor.WHITE&&move.end.row===0)||(pieceToMove.color===PlayerColor.BLACK&&move.end.row===BOARD_LOGIC_SIZE-1)){pieceToMove.type=PieceType.QUEEN;}}newBoard[move.end.row][move.end.col]=pieceToMove;newBoard[move.start.row][move.start.col]=new Piece(PieceType.EMPTY,PlayerColor.NONE);if(newBoard[move.end.row][move.end.col].type!==PieceType.EMPTY){newBoard[move.end.row][move.end.col].hasMoved=true;}return newBoard;}
+        
+        // isKingInCheck with DETAILED LOGGING
+        function isKingInCheck(boardState, playerColor) {
+            console.log(`isKingInCheck: Checking if player ${playerColor} king is in check.`);
+            let kingR = -1, kingC = -1;
+            for (let r = 0; r < BOARD_LOGIC_SIZE; r++) {
+                for (let c = 0; c < BOARD_LOGIC_SIZE; c++) {
+                    if (boardState[r][c].type === PieceType.KING && boardState[r][c].color === playerColor) {
+                        kingR = r; kingC = c;
+                        console.log(`isKingInCheck: Found player ${playerColor} king at (${kingR},${kingC})`);
+                        break;
+                    }
+                }
+                if (kingR !== -1) break;
+            }
+            if (kingR === -1) { console.error(`isKingInCheck: CRITICAL - Player ${playerColor} king NOT FOUND!`); return true; }
+            const opponentColor = getOpponent(playerColor);
+            console.log(`isKingInCheck: Checking attacks from opponent ${opponentColor}`);
+            for (let r = 0; r < BOARD_LOGIC_SIZE; r++) {
+                for (let c = 0; c < BOARD_LOGIC_SIZE; c++) {
+                    const piece = boardState[r][c];
+                    if (piece.color === opponentColor && piece.type !== PieceType.EMPTY) {
+                        // console.log(`isKingInCheck: Potential attacking piece ${Object.keys(PieceType).find(k=>PieceType[k]===piece.type)} at (${r},${c}) for king at (${kingR},${kingC})`);
+                        if (isValidMove(r, c, kingR, kingC, piece, opponentColor, boardState, false)) { // Pass 'false' for checkKingSafety
+                            console.log(`isKingInCheck: KING IN CHECK! Player ${playerColor} king at (${kingR},${kingC}) is attacked by ${Object.keys(PieceType).find(k=>PieceType[k]===piece.type)} from (${r},${c})`);
+                            return true;
+                        }
+                    }
+                }
+            }
+            console.log(`isKingInCheck: Player ${playerColor} king at (${kingR},${kingC}) is NOT in check.`);
+            return false;
+        }
+
+        function isGameOver(boardState,playerToMove){const possibleMoves=generateAllPossibleMoves(boardState,playerToMove);if(possibleMoves.length===0){if(isKingInCheck(boardState,playerToMove)){const winnerName=Object.keys(PlayerColor).find(k=>PlayerColor[k]===getOpponent(playerToMove))||"Opponent";setMessage(winnerName+" WINS by Checkmate!");if(getOpponent(playerToMove)===PlayerColor.WHITE) playSound(audioWin); else playSound(audioLose);return true;}else{setMessage("STALEMATE!");playSound(audioStalemate);return true;}}return false;}function minimax(board,depth,player,alpha,beta,isMaximizingWhite){if(depth===0||isGameOver(board,player)){return evaluateBoard(board);}const possibleMoves=generateAllPossibleMoves(board,player);if(possibleMoves.length===0){return isKingInCheck(board,player)?(isMaximizingWhite?-Infinity:Infinity):0;}if(isMaximizingWhite){let maxEval=-Infinity;for(const move of possibleMoves){const tempBoard=applyMoveToBoardCopy(board,move);const currentEval=minimax(tempBoard,depth-1,getOpponent(player),alpha,beta,false);maxEval=Math.max(maxEval,currentEval);alpha=Math.max(alpha,currentEval);if(beta<=alpha)break;}return maxEval;}else{let minEval=Infinity;for(const move of possibleMoves){const tempBoard=applyMoveToBoardCopy(board,move);const currentEval=minimax(tempBoard,depth-1,getOpponent(player),alpha,beta,true);minEval=Math.min(minEval,currentEval);beta=Math.min(beta,currentEval);if(beta<=alpha)break;}return minEval;}}function findBestMoveMinimax(currentBoardState,player,depth){let bestMove=null;let bestScore;const possibleMoves=generateAllPossibleMoves(currentBoardState,player);if(possibleMoves.length===0){return null;}let topMovesForDisplay = [];if(player===PlayerColor.WHITE){bestScore=-Infinity;for(const move of possibleMoves){const piece = currentBoardState[move.start.row][move.start.col]; if(piece.type === PieceType.EMPTY) continue; const tempBoard=applyMoveToBoardCopy(currentBoardState,move);const score=minimax(tempBoard,depth-1,getOpponent(player),-Infinity,Infinity,false);topMovesForDisplay.push({move:move, score:score, piece:piece});if(score>bestScore){bestScore=score;bestMove={...move,piece:piece.clone(),score:score};}}}else{bestScore=Infinity;for(const move of possibleMoves){const piece = currentBoardState[move.start.row][move.start.col]; if(piece.type === PieceType.EMPTY) continue; const tempBoard=applyMoveToBoardCopy(currentBoardState,move);const score=minimax(tempBoard,depth-1,getOpponent(player),-Infinity,Infinity,true);topMovesForDisplay.push({move:move, score:score, piece:piece});if(score<bestScore){bestScore=score;bestMove={...move,piece:piece.clone(),score:score};}}}if(player===PlayerColor.BLACK)topMovesForDisplay.sort((a,b)=>a.score-b.score);else topMovesForDisplay.sort((a,b)=>b.score-a.score);displayTopMoves(topMovesForDisplay.slice(0,3));if(!bestMove&&possibleMoves.length>0){const firstValidMove = possibleMoves[0]; bestMove={...firstValidMove,piece:currentBoardState[firstValidMove.start.row][firstValidMove.start.col].clone(),score:bestScore};}return bestMove;}function makeAIMove(){if(isGameOverState||currentPlayer!==PlayerColor.BLACK)return;setMessage("AI calculating...");setTimeout(()=>{if(isGameOverState){isPlayerTurn=(currentPlayer===PlayerColor.WHITE);return;}const bestMove=findBestMoveMinimax(boardLogic,PlayerColor.BLACK,AI_SEARCH_DEPTH);if(bestMove && bestMove.piece){const playerWhoMoved = currentPlayer;makeMoveLogic(bestMove.start.row,bestMove.start.col,bestMove.end.row,bestMove.end.col);refresh3DPieceDisplay();const pieceMovedName=Object.keys(PieceType).find(k=>PieceType[k]===bestMove.piece.type)||"Piece";setMessage(`AI moved ${pieceMovedName}.`);if(isKingInCheck(boardLogic,PlayerColor.WHITE)){playSound(audioCheck);setMessage(`AI moved ${pieceMovedName}. Check!`);}if(isKingCaptured(boardLogic,PlayerColor.WHITE)){setMessage("BLACK WINS!");isGameOverState=true;stopPlayerTimer();stopCurrentMoveTimer();updateDigitalClocks();playSound(audioWin);return;}if(isGameOver(boardLogic,PlayerColor.WHITE)){isGameOverState=true;stopPlayerTimer();stopCurrentMoveTimer();updateDigitalClocks();return;}switchPlayer();if(!isGameOverState){pressClockButton(playerWhoMoved);}}else{setMessage("AI has no valid moves or error.");if(!isGameOver(boardLogic,PlayerColor.BLACK)){isGameOverState=true;}stopPlayerTimer();stopCurrentMoveTimer();}updateDigitalClocks();},700);}function displayTopMoves(moves){if(!aiTrainerPanelElement||!topMovesListElement)return;if(moves&&moves.length>0){aiTrainerPanelElement.style.display='block';topMovesListElement.innerHTML='';moves.forEach((m,index)=>{if(!m.piece) return; const pieceName=Object.keys(PieceType).find(k=>PieceType[k]===m.piece.type)||"P";const moveStr=`${pieceName[0]}: ${String.fromCharCode(97+m.move.start.col)}${8-m.move.start.row} -> ${String.fromCharCode(97+m.move.end.col)}${8-m.move.end.row}`;const scoreStr=`(Eval: ${m.score.toFixed(1)})`;topMovesListElement.innerHTML+=`<div>${index+1}. ${moveStr} ${scoreStr}</div>`;});}else{if(aiTrainerPanelElement) aiTrainerPanelElement.style.display='none';}}
+
+        // --- ANIMATION LOOP ---
+        function animateParticles(){if(!particlesPoints||!particlesPoints.geometry||PARTICLE_COUNT===0)return;const positions=particlesPoints.geometry.attributes.position.array;const numParticles=positions.length/3;const particleAnimationSpread=SQUARE_3D_SIZE*BOARD_LOGIC_SIZE*3.0; const particleZResetMax=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+3000; const particleZResetMin=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+200; for(let i=0;i<numParticles;i++){const i3=i*3;positions[i3+0]+=(Math.random()-0.5)*0.06;positions[i3+1]+=(Math.random()-0.5)*0.06;positions[i3+2]+=(Math.random()-0.5)*0.02;if(Math.abs(positions[i3+0])>particleAnimationSpread*1.2)positions[i3+0]*=-0.999;if(Math.abs(positions[i3+1])>particleAnimationSpread*0.7)positions[i3+1]*=-0.999;if(positions[i3+2]>particleZResetMax||positions[i3+2]<particleZResetMin){positions[i3+2]=particleZResetMin+Math.random()*(particleZResetMax-particleZResetMin-100);}}particlesPoints.geometry.attributes.position.needsUpdate=true;}
+        function animate(time){requestAnimationFrame(animate);if(particlesPoints) animateParticles();if(renderer && scene && camera) renderer.render(scene,camera); else if(!renderer) console.warn("animate: renderer not ready.");}
+
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log("DOM fully loaded and parsed. Calling init().");
+            init();
+        });
     </script>
 </body>
 </html>
