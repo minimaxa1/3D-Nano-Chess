@@ -1,0 +1,18 @@
+{
+  "name": "3d-chess-signaling-server",
+  "version": "1.0.0",
+  "description": "Tiny WebSocket signaling server for 3D Chess WebRTC",
+  "main": "tiny_signaling_server.js",
+  "scripts": {
+    "start": "node tiny_signaling_server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "ws": "^8.0.0"
+  },
+  "engines": {
+    "node": "16.x"
+  },
+  "author": "",
+  "license": "ISC"
+}
