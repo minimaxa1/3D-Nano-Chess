@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Cosmic Chess Engine - No 3D Clock, WebRTC Foundation</title>
+    <title>Cosmic Chess Engine - WebRTC via Render Signaling</title>
     <style>
         body { margin: 0; overflow: hidden; background-image: url('your-park-chess-image.jpg'); background-size: cover; background-position: center center; background-repeat: no-repeat; color: white; font-family: 'Arial', sans-serif; }
         #uiPanel { position: absolute; top: 0; left: 0; width: 100%; padding: 10px 15px; box-sizing: border-box; background-color: rgba(10,10,15,0.85); display: flex; justify-content: space-between; align-items: center; font-size: 1.0em; text-shadow: 0 0 5px #000000; z-index: 80; }
@@ -70,8 +70,10 @@
         let localStreamRTC;
         let remoteStreamRTC;
         let peerConnectionRTC;
-        let isInitiatorRTC = false;
+        let isWebRTCInitiator = false; // True if this client is initiating the WebRTC offer
         const rtcConfiguration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        let signalingSocket; // WebSocket for signaling
+        let currentRoomIdRTC; // To store the current room ID from the server
 
 
         const lightSquareMat=new THREE.MeshStandardMaterial({color:0xCCCCCC,roughness:0.8,metalness:0.1});
@@ -96,135 +98,310 @@
         function nextRadioTrack() { if (!backgroundMusicElement || radioTracks.length === 0) return; currentTrackIndex = (currentTrackIndex + 1) % radioTracks.length; backgroundMusicElement.src = radioTracks[currentTrackIndex].src; if (isRadioPlaying) { const playPromise = backgroundMusicElement.play(); if (playPromise !== undefined) { playPromise.catch(error => { console.warn("Next track play failed:", error); isRadioPlaying = false; updateRadioDisplay(); }); } } updateRadioDisplay(); }
         function prevRadioTrack() { if (!backgroundMusicElement || radioTracks.length === 0) return; currentTrackIndex = (currentTrackIndex - 1 + radioTracks.length) % radioTracks.length; backgroundMusicElement.src = radioTracks[currentTrackIndex].src; if (isRadioPlaying) { const playPromise = backgroundMusicElement.play(); if (playPromise !== undefined) { playPromise.catch(error => { console.warn("Prev track play failed:", error); isRadioPlaying = false; updateRadioDisplay(); }); } } updateRadioDisplay(); }
 
-        // --- WebRTC Functions ---
-        async function startLocalVideo() {
+        // --- WebRTC and Signaling Functions ---
+        function connectSignalingServer() {
+            signalingSocket = new WebSocket('wss://threed-nano-chess.onrender.com'); // Your Render server URL
+
+            signalingSocket.onopen = () => {
+                console.log('Connected to signaling server.');
+                connectionStatusRTC.textContent = 'Status: Connected to signaling. Joining room...';
+                const roomId = roomIdInputRTC.value.trim(); // Use user input or allow server to generate
+                signalingSocket.send(JSON.stringify({ type: 'join_room', roomId: roomId }));
+            };
+
+            signalingSocket.onmessage = async (event) => {
+                const message = JSON.parse(event.data);
+                console.log('Message from signaling server:', message);
+
+                switch (message.type) {
+                    case 'room_joined':
+                        currentRoomIdRTC = message.roomId;
+                        roomIdInputRTC.value = currentRoomIdRTC; // Update UI with actual room ID
+                        connectionStatusRTC.textContent = `Status: Joined room ${currentRoomIdRTC}. Peers: ${message.numClients}. You are peer ${message.peerIndex}.`;
+                        if (message.numClients < 2) {
+                            setMessage(`In room ${currentRoomIdRTC}. Waiting for opponent...`);
+                        }
+                        break;
+                    case 'room_full':
+                        connectionStatusRTC.textContent = `Status: Room ${message.roomId} is full.`;
+                        setMessage(`Room ${message.roomId} is full. Try another or new room.`);
+                        signalingSocket.close(); // Or allow trying another room
+                        break;
+                    case 'peer_ready':
+                        isWebRTCInitiator = message.initiator; // Server decides who initiates
+                        connectionStatusRTC.textContent = `Status: Peer ready in ${message.roomId}. You are ${isWebRTCInitiator ? 'initiator' : 'receiver'}. Starting WebRTC...`;
+                        await startLocalVideoAndCreatePC();
+                        break;
+                    case 'offer':
+                        if (!isWebRTCInitiator) { // Receiver handles offer
+                            connectionStatusRTC.textContent = 'Status: Received offer...';
+                            await handleOffer(message.sdp);
+                        }
+                        break;
+                    case 'answer':
+                        if (isWebRTCInitiator) { // Initiator handles answer
+                            connectionStatusRTC.textContent = 'Status: Received answer...';
+                            await handleAnswer(message.sdp);
+                        }
+                        break;
+                    case 'candidate':
+                        connectionStatusRTC.textContent = 'Status: Received ICE candidate...';
+                        await handleCandidate(message.candidate);
+                        break;
+                    case 'peer_disconnected':
+                        connectionStatusRTC.textContent = 'Status: Peer disconnected.';
+                        setMessage("Your opponent has disconnected from the room.");
+                        closeWebRTCConnection();
+                        break;
+                    case 'error':
+                        console.error("Signaling server error:", message.message);
+                        connectionStatusRTC.textContent = `Status: Signaling Error - ${message.message}`;
+                        break;
+                    default:
+                         console.warn("Unknown message type from server:", message.type);
+                }
+            };
+
+            signalingSocket.onclose = (event) => {
+                console.log('Disconnected from signaling server.', event.reason);
+                // Avoid overwriting critical error messages
+                if (!connectionStatusRTC.textContent.toLowerCase().includes('error') && !connectionStatusRTC.textContent.toLowerCase().includes('full')) {
+                     connectionStatusRTC.textContent = 'Status: Disconnected from signaling.';
+                }
+                // Optionally, try to reconnect or prompt user
+            };
+
+            signalingSocket.onerror = (error) => {
+                console.error('Signaling WebSocket error:', error);
+                connectionStatusRTC.textContent = 'Status: Signaling connection error.';
+                setMessage("Could not connect to the signaling service.");
+            };
+        }
+
+        async function startLocalVideoAndCreatePC() {
+            if (!localStreamRTC) {
+                try {
+                    await startLocalVideo(); // Ensure local video is started first
+                } catch (error) {
+                     setMessage("Cannot start WebRTC without local video.");
+                     connectionStatusRTC.textContent = "Status: Camera/Mic access failed.";
+                     return false;
+                }
+            }
+            createPeerConnection(); // Now create the peer connection
+            return true;
+        }
+
+        async function startLocalVideo() { // Made async to use await
             try {
                 localStreamRTC = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 localVideoElementRTC.srcObject = localStreamRTC;
                 videoContainerRTC.style.display = 'flex';
-                connectionStatusRTC.textContent = 'Status: Local video started.';
-                if (peerConnectionRTC) {
-                    localStreamRTC.getTracks().forEach(track => peerConnectionRTC.addTrack(track, localStreamRTC));
+                // Don't set status here, let the calling context do it
+                if (peerConnectionRTC) { // If PC exists (e.g., re-negotiation or late track add)
+                    localStreamRTC.getTracks().forEach(track => {
+                        const sender = peerConnectionRTC.getSenders().find(s => s.track && s.track.kind === track.kind);
+                        if (sender) {
+                            sender.replaceTrack(track).catch(e => console.error("Error replacing track:", e));
+                        } else {
+                            peerConnectionRTC.addTrack(track, localStreamRTC);
+                        }
+                    });
                 }
             } catch (error) {
                 console.error('Error accessing media devices.', error);
-                connectionStatusRTC.textContent = 'Status: Error accessing camera/mic.';
                 setMessage('Could not access camera/microphone.');
+                throw error; // Re-throw to be caught by caller
             }
         }
 
         function createPeerConnection() {
-            if (peerConnectionRTC) { peerConnectionRTC.close(); }
+            if (peerConnectionRTC) {
+                console.log("Closing existing peer connection.");
+                peerConnectionRTC.close();
+            }
             peerConnectionRTC = new RTCPeerConnection(rtcConfiguration);
-            connectionStatusRTC.textContent = 'Status: Peer connection created.';
-            peerConnectionRTC.onicecandidate = handleICECandidateEventRTC;
-            peerConnectionRTC.ontrack = handleTrackEventRTC;
-            peerConnectionRTC.onnegotiationneeded = handleNegotiationNeededEventRTC;
+            console.log("Peer connection created.");
+            // connectionStatusRTC.textContent = 'Status: Peer connection created.'; // Status set by caller context
+
+            peerConnectionRTC.onicecandidate = event => {
+                if (event.candidate && signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
+                    console.log('Local ICE candidate found, sending to server:', event.candidate);
+                    signalingSocket.send(JSON.stringify({
+                        type: 'candidate',
+                        candidate: event.candidate,
+                        roomId: currentRoomIdRTC // Ensure room ID is included
+                    }));
+                }
+            };
+
+            peerConnectionRTC.ontrack = event => {
+                console.log('Remote track received:', event.track.kind);
+                if (event.streams && event.streams[0]) {
+                    remoteVideoElementRTC.srcObject = event.streams[0];
+                    connectionStatusRTC.textContent = 'Status: Connected to peer!';
+                    setMessage("Video connection established with opponent.");
+                } else { // Fallback for older browsers or individual tracks
+                    if (!remoteVideoElementRTC.srcObject) {
+                        remoteVideoElementRTC.srcObject = new MediaStream();
+                    }
+                    remoteVideoElementRTC.srcObject.addTrack(event.track);
+                }
+            };
+
+            peerConnectionRTC.onnegotiationneeded = async () => {
+                console.log('Negotiation needed. isWebRTCInitiator:', isWebRTCInitiator, 'Signaling state:', peerConnectionRTC.signalingState);
+                // Only initiator creates offer, and only if connection is stable (no existing offer/answer process)
+                if (isWebRTCInitiator && peerConnectionRTC.signalingState === "stable") {
+                    try {
+                        connectionStatusRTC.textContent = 'Status: Creating WebRTC offer...';
+                        console.log('Creating offer...');
+                        const offer = await peerConnectionRTC.createOffer();
+                        await peerConnectionRTC.setLocalDescription(offer);
+                        if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
+                            console.log('Sending offer to server:', peerConnectionRTC.localDescription);
+                            signalingSocket.send(JSON.stringify({
+                                type: 'offer',
+                                sdp: peerConnectionRTC.localDescription,
+                                roomId: currentRoomIdRTC // Ensure room ID is included
+                            }));
+                            connectionStatusRTC.textContent = 'Status: Offer sent.';
+                        }
+                    } catch (error) {
+                        console.error('Error creating/sending offer:', error);
+                        connectionStatusRTC.textContent = 'Status: Error creating offer.';
+                    }
+                }
+            };
+
+            // Add local tracks if stream is already available
             if (localStreamRTC) {
+                console.log("Adding local stream tracks to new peer connection.");
                 localStreamRTC.getTracks().forEach(track => peerConnectionRTC.addTrack(track, localStreamRTC));
-            }
-        }
-
-        async function handleNegotiationNeededEventRTC() {
-            console.log('Negotiation needed event fired.');
-            if (isInitiatorRTC) {
-                try {
-                    console.log('Creating offer...');
-                    connectionStatusRTC.textContent = 'Status: Creating offer...';
-                    const offer = await peerConnectionRTC.createOffer();
-                    await peerConnectionRTC.setLocalDescription(offer);
-                    console.log('Offer created. Send via console/signaling:');
-                    console.log(JSON.stringify({ sdp: peerConnectionRTC.localDescription }));
-                    connectionStatusRTC.textContent = 'Status: Offer created. Copy from console.';
-                } catch (error) {
-                    console.error('Error creating offer:', error);
-                    connectionStatusRTC.textContent = 'Status: Error creating offer.';
-                }
-            }
-        }
-
-        function handleICECandidateEventRTC(event) {
-            if (event.candidate) {
-                console.log('ICE candidate. Send via console/signaling:');
-                console.log(JSON.stringify({ ice: event.candidate }));
-                connectionStatusRTC.textContent = 'Status: ICE candidate. Copy from console.';
-            }
-        }
-
-        function handleTrackEventRTC(event) {
-            console.log('Track event received.');
-            if (event.streams && event.streams[0]) {
-                remoteVideoElementRTC.srcObject = event.streams[0];
-                remoteStreamRTC = event.streams[0];
-                connectionStatusRTC.textContent = 'Status: Remote stream received.';
             } else {
-                if (!remoteStreamRTC) {
-                    remoteStreamRTC = new MediaStream();
-                    remoteVideoElementRTC.srcObject = remoteStreamRTC;
-                }
-                remoteStreamRTC.addTrack(event.track);
+                console.warn("Local stream not available when creating peer connection. Tracks will be added later if stream starts.");
             }
         }
 
-        async function handleSignalingDataInput(dataString) {
+        async function handleOffer(offerSdp) {
             if (!peerConnectionRTC) {
-                console.warn("PeerConnection not initialized. Click 'Create/Join Room' first.");
-                setMessage("Initialize connection first (Create/Join Room).");
-                return;
+                console.warn("Received offer but PeerConnection is not ready. Attempting to initialize.");
+                if (!(await startLocalVideoAndCreatePC())) { // This calls createPeerConnection internally
+                     console.error("Failed to setup local media/PC for handling offer.");
+                     setMessage("Error setting up for offer.");
+                     return;
+                }
+            }
+             // Check if an offer (local or remote) is already in progress.
+            if (peerConnectionRTC.signalingState !== "stable" && peerConnectionRTC.signalingState !== "have-remote-offer") {
+                console.warn(`Cannot handle offer in signalingState: ${peerConnectionRTC.signalingState}. Possible glare.`);
+                // Basic glare handling: if we are also an initiator and have a local offer, perhaps one side yields.
+                // For simplicity here, we just log and proceed cautiously or could return.
+                // A more robust solution might involve comparing initiator flags or random tie-breaking.
+                // If we already have a remote offer, this might be a duplicate or race condition.
             }
             try {
-                const data = JSON.parse(dataString);
-                if (data.sdp) {
-                    connectionStatusRTC.textContent = 'Status: Received SDP...';
-                    console.log('Received SDP:', data.sdp);
-                    await peerConnectionRTC.setRemoteDescription(new RTCSessionDescription(data.sdp));
-                    console.log('Remote description set.');
-                    if (data.sdp.type === 'offer' && !isInitiatorRTC) {
-                        console.log('Creating answer...');
-                        connectionStatusRTC.textContent = 'Status: Creating answer...';
-                        const answer = await peerConnectionRTC.createAnswer();
-                        await peerConnectionRTC.setLocalDescription(answer);
-                        console.log('Answer created. Send via console/signaling:');
-                        console.log(JSON.stringify({ sdp: peerConnectionRTC.localDescription }));
-                        connectionStatusRTC.textContent = 'Status: Answer created. Copy from console.';
-                    }
-                } else if (data.ice) {
-                    connectionStatusRTC.textContent = 'Status: Received ICE candidate...';
-                    console.log('Received ICE candidate:', data.ice);
-                    await peerConnectionRTC.addIceCandidate(new RTCIceCandidate(data.ice));
-                    console.log('ICE candidate added.');
-                    connectionStatusRTC.textContent = 'Status: ICE candidate added.';
+                console.log("Setting remote offer description.");
+                await peerConnectionRTC.setRemoteDescription(new RTCSessionDescription(offerSdp));
+                connectionStatusRTC.textContent = 'Status: Offer received. Creating answer...';
+                console.log('Creating answer...');
+                const answer = await peerConnectionRTC.createAnswer();
+                await peerConnectionRTC.setLocalDescription(answer);
+                if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
+                    console.log('Sending answer to server:', peerConnectionRTC.localDescription);
+                    signalingSocket.send(JSON.stringify({
+                        type: 'answer',
+                        sdp: peerConnectionRTC.localDescription,
+                        roomId: currentRoomIdRTC // Ensure room ID is included
+                    }));
+                    connectionStatusRTC.textContent = 'Status: Answer sent.';
                 }
             } catch (error) {
-                console.error('Error handling signaling data:', error);
-                connectionStatusRTC.textContent = 'Status: Error in signaling data.';
+                console.error('Error handling offer / creating answer:', error);
+                connectionStatusRTC.textContent = 'Status: Error processing offer.';
             }
         }
 
-        async function setupAndJoinOrCreateRoom(){
-            const roomId = roomIdInputRTC.value.trim();
-            isInitiatorRTC = (roomId === '');
+        async function handleAnswer(answerSdp) {
+            if (!peerConnectionRTC || peerConnectionRTC.signalingState !== 'have-local-offer') {
+                 console.warn(`Cannot handle answer. PC not ready or not in 'have-local-offer' state. Current state: ${peerConnectionRTC ? peerConnectionRTC.signalingState : 'null'}`);
+                 connectionStatusRTC.textContent = 'Status: Error: Invalid state for answer.';
+                 return;
+            }
+            try {
+                console.log("Setting remote answer description.");
+                await peerConnectionRTC.setRemoteDescription(new RTCSessionDescription(answerSdp));
+                console.log('Remote answer set. Connection should establish.');
+                connectionStatusRTC.textContent = 'Status: Answer received. Connecting...';
+            } catch (error) {
+                console.error('Error handling answer:', error);
+                connectionStatusRTC.textContent = 'Status: Error processing answer.';
+            }
+        }
 
-            if (!localStreamRTC) {
-                await startLocalVideo();
-                if (!localStreamRTC) {
-                    setMessage("Cannot proceed without local video.");
-                    return;
+        async function handleCandidate(candidate) {
+            if (!peerConnectionRTC) {
+                 console.warn("Cannot handle ICE candidate. PeerConnection not ready.");
+                 connectionStatusRTC.textContent = 'Status: Error: PC not ready for ICE.';
+                 return;
+            }
+            try {
+                if (candidate) { // Ensure candidate is not null/empty
+                    console.log("Adding received ICE candidate:", candidate);
+                    await peerConnectionRTC.addIceCandidate(new RTCIceCandidate(candidate));
+                    console.log('ICE candidate added.');
+                } else {
+                    console.log("Received null/empty ICE candidate, ignoring.");
+                }
+            } catch (error) {
+                 // It's common to get an error if the PC is not yet in a state to add candidates (e.g., remote description not set)
+                 // or if it's an empty candidate string after the "end-of-candidates" signal.
+                if (candidate && candidate.candidate) { // Only log actual errors for non-empty candidates
+                    console.error('Error adding received ICE candidate:', error);
                 }
             }
-            createPeerConnection();
-            if (isInitiatorRTC) {
-                console.log("Acting as initiator.");
-                connectionStatusRTC.textContent = 'Status: Initiator. Waiting for negotiation...';
-            } else {
-                console.log(`Attempting to join room (conceptually): ${roomId}`);
-                connectionStatusRTC.textContent = `Status: Joining room ${roomId}. Waiting for offer...`;
-            }
         }
+
+        function setupAndJoinOrCreateRoom(){
+            if (signalingSocket && (signalingSocket.readyState === WebSocket.OPEN || signalingSocket.readyState === WebSocket.CONNECTING)) {
+                console.log("Signaling connection already open or connecting. Closing to restart.");
+                signalingSocket.close();
+            }
+            // Reset WebRTC state before attempting new connection
+            closeWebRTCConnection();
+            connectionStatusRTC.textContent = 'Status: Connecting to signaling...';
+            connectSignalingServer();
+        }
+
+        function closeWebRTCConnection() {
+            if (localStreamRTC) {
+                localStreamRTC.getTracks().forEach(track => track.stop());
+                localStreamRTC = null;
+                localVideoElementRTC.srcObject = null;
+            }
+            if (remoteStreamRTC) { // remoteStreamRTC is set in ontrack, ensure it's cleared
+                remoteStreamRTC.getTracks().forEach(track => track.stop());
+                remoteStreamRTC = null;
+                remoteVideoElementRTC.srcObject = null;
+            }
+            if (peerConnectionRTC) {
+                peerConnectionRTC.onicecandidate = null;
+                peerConnectionRTC.ontrack = null;
+                peerConnectionRTC.onnegotiationneeded = null;
+                peerConnectionRTC.close();
+                peerConnectionRTC = null;
+            }
+            videoContainerRTC.style.display = 'none';
+            isWebRTCInitiator = false; // Reset initiator state
+            // currentRoomIdRTC is usually kept until a new room is joined or explicitly left
+            console.log("WebRTC connection and streams closed.");
+        }
+
 
         // --- INITIALIZATION ---
         function init() {
-            console.log("Initializing Cosmic Chess Engine - No 3D Clock, WebRTC Foundation...");
+            console.log("Initializing Cosmic Chess Engine - WebRTC via Render Signaling...");
+            connectionStatusRTC.textContent = 'Status: Disconnected. Click Create/Join.'; // Initial status
 
             turnLabelElement = document.getElementById('turnLabel');
             messageLabelElement = document.getElementById('messageLabel');
@@ -234,7 +411,7 @@
             remoteVideoElementRTC = document.getElementById('remoteVideo');
             roomIdInputRTC = document.getElementById('roomIdInput');
             createJoinRoomBtnRTC = document.getElementById('createRoomBtnWebRTC');
-            connectionStatusRTC = document.getElementById('connectionStatus');
+            // connectionStatusRTC = document.getElementById('connectionStatus'); // Already assigned above
             videoContainerRTC = document.getElementById('videoContainer');
             aiTrainerPanelElement = document.getElementById('aiTrainerPanel');
             topMovesListElement = document.getElementById('topMovesList');
@@ -296,19 +473,22 @@
         }
 
         // --- 3D SETUP AND RENDERING FUNCTIONS ---
+        // ... (These functions: setupLighting, create3DBoardAndBorder, createPieceMesh, createParticles are assumed correct and unchanged)
         function setupLighting() { const ambientLight=new THREE.AmbientLight(0x707070);scene.add(ambientLight);const keyLight=new THREE.DirectionalLight(0xffffff,0.8);keyLight.position.set(-60,100,50);keyLight.castShadow=true;keyLight.shadow.mapSize.width=2048;keyLight.shadow.mapSize.height=2048;const dS=SQUARE_3D_SIZE*BOARD_LOGIC_SIZE;keyLight.shadow.camera.left=-dS;keyLight.shadow.camera.right=dS;keyLight.shadow.camera.top=dS;keyLight.shadow.camera.bottom=-dS;keyLight.shadow.camera.near=30;keyLight.shadow.camera.far=280;keyLight.shadow.bias=-0.0004;scene.add(keyLight);const fillLight=new THREE.DirectionalLight(0x9090A0,0.35);fillLight.position.set(60,70,-40);scene.add(fillLight); }
         function create3DBoardAndBorder(){ const squareGeo=new THREE.BoxGeometry(SQUARE_3D_SIZE,SQUARE_THICKNESS,SQUARE_3D_SIZE);for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const currentSquareMat=((r+c)%2===0?lightSquareMat.clone():darkSquareMat.clone());const squareMesh=new THREE.Mesh(squareGeo,currentSquareMat);squareMesh.position.set((c-(BOARD_LOGIC_SIZE-1)/2.0)*SQUARE_3D_SIZE,-SQUARE_THICKNESS/2.0,(r-(BOARD_LOGIC_SIZE-1)/2.0)*SQUARE_3D_SIZE);squareMesh.receiveShadow=true;squareMesh.userData={type:'square',row:r,col:c,originalMat:currentSquareMat};boardGroup.add(squareMesh);squareMeshes[`r${r}c${c}`]=squareMesh;}}const boardPlayingAreaSize=BOARD_LOGIC_SIZE*SQUARE_3D_SIZE;const borderOuterSize=boardPlayingAreaSize+2*BORDER_WIDTH;const borderGeo=new THREE.BoxGeometry(borderOuterSize,SQUARE_THICKNESS,borderOuterSize);const borderMesh=new THREE.Mesh(borderGeo,borderMat);borderMesh.position.y=-SQUARE_THICKNESS/2.0-0.02; borderMesh.receiveShadow=true;boardGroup.add(borderMesh);}
         function createPieceMesh(pieceLogic){ const material=(pieceLogic.color===PlayerColor.WHITE?whitePieceMat.clone():blackPieceMat.clone());const pieceGroup=new THREE.Group();const R=PIECE_BASE_SCALE;const H_SEG=PIECE_BASE_SCALE*0.45;let mainBody,head,topFeature;switch(pieceLogic.type){case PieceType.PAWN:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.55,R*0.65,H_SEG*1.8,12),material);mainBody.position.y=H_SEG*0.9;head=new THREE.Mesh(new THREE.SphereGeometry(R*0.5,12,8),material);head.position.y=H_SEG*1.8+R*0.45;pieceGroup.add(mainBody,head);break;case PieceType.ROOK:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.7,R*0.7,H_SEG*2.8,12),material);mainBody.position.y=H_SEG*1.4;topFeature=new THREE.Mesh(new THREE.CylinderGeometry(R*0.85,R*0.85,H_SEG*0.7,12),material);topFeature.position.y=H_SEG*2.8+H_SEG*0.35;pieceGroup.add(mainBody,topFeature);break;case PieceType.KNIGHT:const knightBaseG=new THREE.Mesh(new THREE.CylinderGeometry(R*0.7,R*0.8,H_SEG*1.2,12),material);knightBaseG.position.y=H_SEG*0.6;mainBody=new THREE.Mesh(new THREE.BoxGeometry(R*1.0,H_SEG*1.8,R*0.55),material);mainBody.position.y=H_SEG*1.2+H_SEG*0.9;mainBody.rotation.y=Math.PI/16;head=new THREE.Mesh(new THREE.SphereGeometry(R*0.45,12,8),material);head.scale.set(1.1,1.3,0.9);head.position.y=mainBody.position.y+H_SEG*0.9;head.position.x=R*0.35;head.rotation.z=-Math.PI/7;pieceGroup.add(knightBaseG,mainBody,head);break;case PieceType.BISHOP:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.5,R*0.7,H_SEG*2.8,12),material);mainBody.position.y=H_SEG*1.4;head=new THREE.Mesh(new THREE.SphereGeometry(R*0.6,12,8),material);head.position.y=H_SEG*2.8+R*0.5;topFeature=new THREE.Mesh(new THREE.SphereGeometry(R*0.2,8,6),material);topFeature.position.y=head.position.y+R*0.55;topFeature.scale.y=1.6;pieceGroup.add(mainBody,head,topFeature);break;case PieceType.QUEEN:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.6,R*0.8,H_SEG*3.0,12),material);mainBody.position.y=H_SEG*1.5;head=new THREE.Mesh(new THREE.SphereGeometry(R*0.65,12,8),material);head.position.y=H_SEG*3.0+R*0.55;for(let i=0;i<6;i++){const point=new THREE.Mesh(new THREE.ConeGeometry(R*0.1,H_SEG*0.6,6),material);point.position.y=head.position.y+R*0.3+H_SEG*0.3;const angle=i*Math.PI*2/6;point.position.x=Math.cos(angle)*R*0.5;point.position.z=Math.sin(angle)*R*0.5;point.rotation.x=Math.PI/16;pieceGroup.add(point);}pieceGroup.add(mainBody,head);break;case PieceType.KING:mainBody=new THREE.Mesh(new THREE.CylinderGeometry(R*0.7,R*0.9,H_SEG*3.3,12),material);mainBody.position.y=H_SEG*1.65;const crossBase=new THREE.Mesh(new THREE.CylinderGeometry(R*0.3,R*0.3,H_SEG*0.3,8),material);crossBase.position.y=H_SEG*3.3+H_SEG*0.15;topFeature=new THREE.Mesh(new THREE.BoxGeometry(R*0.12,H_SEG*0.6,R*0.12),material);topFeature.position.y=crossBase.position.y+H_SEG*0.3+H_SEG*0.3;const crossArm=new THREE.Mesh(new THREE.BoxGeometry(H_SEG*0.5,R*0.12,R*0.12),material);crossArm.position.y=topFeature.position.y-H_SEG*0.05;pieceGroup.add(mainBody,crossBase,topFeature,crossArm);break;default: const errGeo=new THREE.BoxGeometry(R,R,R); const errMesh = new THREE.Mesh(errGeo, new THREE.MeshBasicMaterial({color:0xff0000})); pieceGroup.add(errMesh); break;} return pieceGroup;}
         function createParticles(count){if(count===0){return;}const positions=[];const particleMaterial=new THREE.PointsMaterial({color:0xffffff,size:0.07,sizeAttenuation:true,transparent:true,opacity:0.4,blending:THREE.AdditiveBlending,depthWrite:false});const particleAnimationSpread=SQUARE_3D_SIZE*BOARD_LOGIC_SIZE*3.0; const particleZResetMax=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+3000; const particleZResetMin=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+200; for(let i=0;i<count;i++){const x=(Math.random()-0.5)*particleAnimationSpread;const y=(Math.random()-0.5)*particleAnimationSpread*0.6;const z=particleZResetMin+Math.random()*(particleZResetMax-particleZResetMin);positions.push(x,y,z);}const particleGeometry=new THREE.BufferGeometry();particleGeometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));particlesPoints=new THREE.Points(particleGeometry,particleMaterial);scene.add(particlesPoints);}
 
         // --- CHESS LOGIC FUNCTIONS ---
+        // ... (These functions: initializeBoardLogicStandard, getOpponent, isPathClear, isValidMove, refresh3DPieceDisplay,
+        //     makeMoveLogic, switchPlayer, isKingCaptured, initializeTimers, formatTime, updateDigitalClocks,
+        //     startPlayerTimer, stopPlayerTimer, pressClockButton, onBoardClick, AI logic, animateParticles, animate
+        //     are assumed correct and unchanged from the previous fully working version before WebRTC integration)
         function initializeBoardLogicStandard(){ for(let r=0; r<BOARD_LOGIC_SIZE; r++) for(let c=0; c<BOARD_LOGIC_SIZE; c++) boardLogic[r][c] = new Piece(PieceType.EMPTY, PlayerColor.NONE); const P = PieceType, C = PlayerColor; boardLogic[0][0]=new Piece(P.ROOK,C.BLACK); boardLogic[0][1]=new Piece(P.KNIGHT,C.BLACK); boardLogic[0][2]=new Piece(P.BISHOP,C.BLACK); boardLogic[0][3]=new Piece(P.QUEEN,C.BLACK); boardLogic[0][4]=new Piece(P.KING,C.BLACK); boardLogic[0][5]=new Piece(P.BISHOP,C.BLACK); boardLogic[0][6]=new Piece(P.KNIGHT,C.BLACK); boardLogic[0][7]=new Piece(P.ROOK,C.BLACK); for(let c=0;c<8;c++) boardLogic[1][c]=new Piece(P.PAWN,C.BLACK); for(let c=0;c<8;c++) boardLogic[6][c]=new Piece(P.PAWN,C.WHITE); boardLogic[7][0]=new Piece(P.ROOK,C.WHITE); boardLogic[7][1]=new Piece(P.KNIGHT,C.WHITE); boardLogic[7][2]=new Piece(P.BISHOP,C.WHITE); boardLogic[7][3]=new Piece(P.QUEEN,C.WHITE); boardLogic[7][4]=new Piece(P.KING,C.WHITE); boardLogic[7][5]=new Piece(P.BISHOP,C.WHITE); boardLogic[7][6]=new Piece(P.KNIGHT,C.WHITE); boardLogic[7][7]=new Piece(P.ROOK,C.WHITE); currentPlayer = C.WHITE;}
         function getOpponent(player){return player===PlayerColor.WHITE?PlayerColor.BLACK:PlayerColor.WHITE;}
         function isPathClear(startR,startC,endR,endC,boardState=boardLogic){const stepR=Math.sign(endR-startR);const stepC=Math.sign(endC-startC);let currentR=startR+stepR;let currentC=startC+stepC;while(currentR!==endR||currentC!==endC){if(boardState[currentR][currentC].type!==PieceType.EMPTY)return false;currentR+=stepR;currentC+=stepC;}return true;}
         function isValidMove(startR,startC,endR,endC,piece,playerColor,boardState=boardLogic,checkKingSafety=true){if(!piece || piece.type === PieceType.EMPTY) return false; if(startR<0||startR>=BOARD_LOGIC_SIZE||startC<0||startC>=BOARD_LOGIC_SIZE||endR<0||endR>=BOARD_LOGIC_SIZE||endC<0||endC>=BOARD_LOGIC_SIZE)return false;if(startR===endR&&startC===endC)return false;const targetPiece=boardState[endR][endC];if(targetPiece.type!==PieceType.EMPTY&&targetPiece.color===playerColor)return false;const dR=endR-startR;const dC=endC-startC;let validBasicMove=false;switch(piece.type){case PieceType.PAWN:const dir=(playerColor===PlayerColor.WHITE)?-1:1;if(dC===0&&dR===dir&&targetPiece.type===PieceType.EMPTY)validBasicMove=true;if(dC===0&&dR===2*dir&&targetPiece.type===PieceType.EMPTY&&!piece.hasMoved&&boardState[startR+dir][startC].type===PieceType.EMPTY)validBasicMove=true;if(Math.abs(dC)===1&&dR===dir&&targetPiece.type!==PieceType.EMPTY&&targetPiece.color!==playerColor)validBasicMove=true;break;case PieceType.ROOK:if(dR===0||dC===0)validBasicMove=isPathClear(startR,startC,endR,endC,boardState);break;case PieceType.BISHOP:if(Math.abs(dR)===Math.abs(dC))validBasicMove=isPathClear(startR,startC,endR,endC,boardState);break;case PieceType.QUEEN:if(dR===0||dC===0||Math.abs(dR)===Math.abs(dC))validBasicMove=isPathClear(startR,startC,endR,endC,boardState);break;case PieceType.KING:validBasicMove=(Math.abs(dR)<=1&&Math.abs(dC)<=1);break;case PieceType.KNIGHT:validBasicMove=((Math.abs(dR)===2&&Math.abs(dC)===1)||(Math.abs(dR)===1&&Math.abs(dC)===2));break;default:return false;}if(!validBasicMove)return false;if(checkKingSafety){const tempBoard=applyMoveToBoardCopy(boardState,{start:{row:startR,col:startC},end:{row:endR,col:endC}});if(isKingInCheck(tempBoard,playerColor))return false;}return true;}
         function refresh3DPieceDisplay(highlightingMoves = false){if (!highlightingMoves) { Object.values(pieceMeshes).forEach(meshGroup=>{ if(meshGroup.parent) meshGroup.parent.remove(meshGroup); meshGroup.traverse(child=>{if(child.isMesh){if(child.geometry)child.geometry.dispose();if(child.material){if(Array.isArray(child.material)){child.material.forEach(mat=>mat.dispose());}else{child.material.dispose();}}}}); });pieceMeshes={};for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const pL=boardLogic[r][c];if(pL.type!==PieceType.EMPTY){const p3DG=createPieceMesh(pL);if(p3DG){p3DG.position.set((c-(BOARD_LOGIC_SIZE-1)/2.0)*SQUARE_3D_SIZE,0.01,(r-(BOARD_LOGIC_SIZE-1)/2.0)*SQUARE_3D_SIZE);p3DG.userData={type:'piece',row:r,col:c,piece:pL};p3DG.traverse(ch=>{if(ch.isMesh){ch.castShadow=true;ch.receiveShadow=true;}});boardGroup.add(p3DG);pieceMeshes[`r${r}c${c}`]=p3DG;} }}}}Object.values(squareMeshes).forEach(sq=>{ if(sq.userData.originalMat) sq.material = sq.userData.originalMat.clone(); });if(selectedPieceInfo && selectedPieceInfo.pieceLogic && squareMeshes[`r${selectedPieceInfo.row}c${selectedPieceInfo.col}`]){squareMeshes[`r${selectedPieceInfo.row}c${selectedPieceInfo.col}`].material = highlightMat.clone();const piece = selectedPieceInfo.pieceLogic; const rStart = selectedPieceInfo.row; const cStart = selectedPieceInfo.col;for (let rEnd = 0; rEnd < BOARD_LOGIC_SIZE; rEnd++) {for (let cEnd = 0; cEnd < BOARD_LOGIC_SIZE; cEnd++) {if (isValidMove(rStart, cStart, rEnd, cEnd, piece, currentPlayer, boardLogic, true)) {const squareKey = `r${rEnd}c${cEnd}`;if (squareMeshes[squareKey] && squareMeshes[squareKey] !== squareMeshes[`r${selectedPieceInfo.row}c${selectedPieceInfo.col}`]) {squareMeshes[squareKey].material = validMoveMat.clone();}}}}}}
-
-        // --- GAME MANAGEMENT FUNCTIONS ---
         function makeMoveLogic(startR,startC,endR,endC){const movingPiece=boardLogic[startR][startC].clone();const originalTargetPiece = boardLogic[endR][endC].clone();if(movingPiece.type===PieceType.PAWN){if((movingPiece.color===PlayerColor.WHITE&&endR===0)||(movingPiece.color===PlayerColor.BLACK&&endR===BOARD_LOGIC_SIZE-1)){movingPiece.type=PieceType.QUEEN;setMessage("Pawn promoted!");}}boardLogic[endR][endC]=movingPiece;boardLogic[startR][startC]=new Piece(PieceType.EMPTY,PlayerColor.NONE);boardLogic[endR][endC].hasMoved=true;if (originalTargetPiece.type !== PieceType.EMPTY) {playSound(audioCapture);} else {playSound(audioMove);}}
         function switchPlayer(){stopCurrentMoveTimer();currentPlayer=getOpponent(currentPlayer);updateTurnLabel();isPlayerTurn=(currentPlayer===PlayerColor.WHITE);if(isGameOverState)isPlayerTurn=false;else startCurrentMoveTimer(currentPlayer);}
         function isKingCaptured(boardState,kingColor){for(let r=0;r<BOARD_LOGIC_SIZE;r++)for(let c=0;c<BOARD_LOGIC_SIZE;c++)if(boardState[r][c].type===PieceType.KING&&boardState[r][c].color===kingColor)return false;return true;}
@@ -318,97 +498,8 @@
         function startPlayerTimer(playerColor){if(isGameOverState)return;if(gameTimerInterval)clearInterval(gameTimerInterval);activeTimerSide=playerColor;gameTimerInterval=setInterval(()=>{if(isGameOverState){clearInterval(gameTimerInterval);return;}if(activeTimerSide===PlayerColor.WHITE){timerWhite--;if(timerWhite<0){timerWhite=0;clearInterval(gameTimerInterval);setMessage("WHITE's time is up! BLACK wins!");isGameOverState=true;isPlayerTurn=false; playSound(audioLose);}}else if(activeTimerSide===PlayerColor.BLACK){timerBlack--;if(timerBlack<0){timerBlack=0;clearInterval(gameTimerInterval);setMessage("BLACK's time is up! WHITE wins!");isGameOverState=true;isPlayerTurn=false; playSound(audioWin);}}updateDigitalClocks();},1000);}
         function stopPlayerTimer(){if(gameTimerInterval)clearInterval(gameTimerInterval);activeTimerSide=null;}
         function pressClockButton(playerWhoJustMoved) {if(isGameOverState){stopPlayerTimer();return;}stopPlayerTimer();const nextPlayerToStartTimer=getOpponent(playerWhoJustMoved);startPlayerTimer(nextPlayerToStartTimer);updateDigitalClocks();}
-
-        function onBoardClick(event){
-            if(isGameOverState || !isPlayerTurn ){ return; } // Player can only interact if it's their turn
-            event.preventDefault(); setMessage("");
-            const mouse=new THREE.Vector2((event.clientX/renderer.domElement.clientWidth)*2-1,-(event.clientY/renderer.domElement.clientHeight)*2+1);
-            const raycaster=new THREE.Raycaster(); raycaster.setFromCamera(mouse,camera);
-            const intersectableObjects = [...boardGroup.children]; // Removed clockGroup from intersectables
-            const intersects=raycaster.intersectObjects(intersectableObjects,true);
-
-            if (intersects.length > 0) {
-                let clickedUserData = null;
-                for (let i = 0; i < intersects.length; i++) {
-                    let obj = intersects[i].object;
-                    while (obj.parent && obj.parent !== scene && !(obj.userData && obj.userData.type)) { obj = obj.parent; }
-                    // Only consider squares and pieces, no clockButton
-                    if (obj.userData && (obj.userData.type === 'square' || obj.userData.type === 'piece')) {
-                        clickedUserData = obj.userData; break;
-                    }
-                }
-
-                if (clickedUserData) {
-                    // Removed direct clock button interaction logic
-                    if (currentPlayer !== PlayerColor.WHITE || !isPlayerTurn) {
-                        setMessage("Wait for your turn or AI move.");
-                        return;
-                    }
-
-                    const r = clickedUserData.row; const c = clickedUserData.col;
-                    if (selectedPieceInfo === null) {
-                        if (boardLogic[r][c].type !== PieceType.EMPTY && boardLogic[r][c].color === currentPlayer) {
-                            selectedPieceInfo = { pieceLogic: boardLogic[r][c], row: r, col: c };
-                            refresh3DPieceDisplay(true);
-                        } else if (boardLogic[r][c].type !== PieceType.EMPTY) {
-                            setMessage("Not your piece!"); refresh3DPieceDisplay();
-                        } else {
-                            refresh3DPieceDisplay();
-                        }
-                    } else {
-                        if (isValidMove(selectedPieceInfo.row, selectedPieceInfo.col, r, c, selectedPieceInfo.pieceLogic, currentPlayer, boardLogic, true)) {
-                            const playerWhoMoved = currentPlayer;
-                            makeMoveLogic(selectedPieceInfo.row, selectedPieceInfo.col, r, c);
-                            const opponentColor = getOpponent(currentPlayer);
-                            if (isKingInCheck(boardLogic, opponentColor)) { playSound(audioCheck); setMessage("Check!"); }
-                            if (isKingCaptured(boardLogic, opponentColor)) {
-                                setMessage((Object.keys(PlayerColor).find(k => PlayerColor[k] === currentPlayer) || "Player") + " WINS!");
-                                isGameOverState = true; isPlayerTurn = false; stopPlayerTimer(); stopCurrentMoveTimer(); updateDigitalClocks();
-                                if (currentPlayer === PlayerColor.WHITE) playSound(audioWin); else playSound(audioLose);
-                                selectedPieceInfo = null; refresh3DPieceDisplay(); return;
-                            }
-                            if (isGameOver(boardLogic, opponentColor)) {
-                                isGameOverState = true; isPlayerTurn = false; stopPlayerTimer(); stopCurrentMoveTimer(); updateDigitalClocks();
-                                selectedPieceInfo = null; refresh3DPieceDisplay(); return;
-                            }
-                            switchPlayer();
-                            pressClockButton(playerWhoMoved);
-                            selectedPieceInfo = null;
-                            refresh3DPieceDisplay();
-                            if (currentPlayer === PlayerColor.BLACK && !isGameOverState) {
-                                makeAIMove();
-                            }
-                        } else {
-                            if (boardLogic[r][c].type !== PieceType.EMPTY && boardLogic[r][c].color === currentPlayer) {
-                                selectedPieceInfo = { pieceLogic: boardLogic[r][c], row: r, col: c };
-                                refresh3DPieceDisplay(true);
-                            } else {
-                                setMessage("Invalid move for " + (Object.keys(PieceType).find(k => PieceType[k] === selectedPieceInfo.pieceLogic.type) || "Piece"));
-                                selectedPieceInfo = null; refresh3DPieceDisplay();
-                            }
-                        }
-                    }
-                }
-            } else {
-                selectedPieceInfo = null; refresh3DPieceDisplay();
-            }
-        }
-
-        // --- AI LOGIC ---
-        const AI_SEARCH_DEPTH = 2;
-        const pieceValues = { [PieceType.PAWN]: 100, [PieceType.KNIGHT]: 320, [PieceType.BISHOP]: 330, [PieceType.ROOK]: 500, [PieceType.QUEEN]: 900, [PieceType.KING]: 20000 };
-        const pawnTable = [[0,0,0,0,0,0,0,0],[50,50,50,50,50,50,50,50],[10,10,20,30,30,20,10,10],[5,5,10,25,25,10,5,5],[0,0,0,20,20,0,0,0],[5,-5,-10,0,0,-10,-5,5],[5,10,10,-20,-20,10,10,5],[0,0,0,0,0,0,0,0]];
-        function evaluateBoard(board){let score=0;for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const piece=board[r][c];if(piece.type!==PieceType.EMPTY){let value=pieceValues[piece.type]||0;if(piece.type===PieceType.PAWN){value+=(piece.color===PlayerColor.WHITE)?pawnTable[r][c]:pawnTable[7-r][c];}if(piece.color===PlayerColor.WHITE){score+=value;}else{score-=value;}}}}return score;}
-        function generateAllPossibleMoves(currentBoard,player){const moves=[];for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){if(currentBoard[r][c].color===player){const piece = currentBoard[r][c]; if(piece.type === PieceType.EMPTY) continue; for(let tr=0;tr<BOARD_LOGIC_SIZE;tr++){for(let tc=0;tc<BOARD_LOGIC_SIZE;tc++){if(isValidMove(r,c,tr,tc,piece,player,currentBoard,false)){const tempBoardAfterMove=applyMoveToBoardCopy(currentBoard,{start:{row:r,col:c},end:{row:tr,col:tc}});if(!isKingInCheck(tempBoardAfterMove,player)){moves.push({start:{row:r,col:c},end:{row:tr,col:tc}});}}}}}}}return moves;}
-        function applyMoveToBoardCopy(originalBoard,move){const newBoard=originalBoard.map(row=>row.map(p=>p.clone()));const pieceToMove=newBoard[move.start.row][move.start.col];if(pieceToMove.type===PieceType.PAWN){if((pieceToMove.color===PlayerColor.WHITE&&move.end.row===0)||(pieceToMove.color===PlayerColor.BLACK&&move.end.row===BOARD_LOGIC_SIZE-1)){pieceToMove.type=PieceType.QUEEN;}}newBoard[move.end.row][move.end.col]=pieceToMove;newBoard[move.start.row][move.start.col]=new Piece(PieceType.EMPTY,PlayerColor.NONE);if(newBoard[move.end.row][move.end.col].type!==PieceType.EMPTY){newBoard[move.end.row][move.end.col].hasMoved=true;}return newBoard;}
-        function isKingInCheck(boardState,playerColor){let kingR=-1,kingC=-1;for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){if(boardState[r][c].type===PieceType.KING&&boardState[r][c].color===playerColor){kingR=r;kingC=c;break;}}if(kingR===-1)return true;}const opponentColor=getOpponent(playerColor);for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const piece=boardState[r][c];if(piece.color===opponentColor && piece.type !== PieceType.EMPTY){if(isValidMove(r,c,kingR,kingC,piece,opponentColor,boardState,false)){return true;}}}}return false;}
-        function isGameOver(boardState,playerToMove){const possibleMoves=generateAllPossibleMoves(boardState,playerToMove);if(possibleMoves.length===0){if(isKingInCheck(boardState,playerToMove)){const winnerName=Object.keys(PlayerColor).find(k=>PlayerColor[k]===getOpponent(playerToMove))||"Opponent";setMessage(winnerName+" WINS by Checkmate!");if(getOpponent(playerToMove)===PlayerColor.WHITE) playSound(audioWin); else playSound(audioLose);return true;}else{setMessage("STALEMATE!");playSound(audioStalemate);return true;}}return false;}
-        function minimax(board,depth,player,alpha,beta,isMaximizingWhite){if(depth===0||isGameOver(board,player)){return evaluateBoard(board);}const possibleMoves=generateAllPossibleMoves(board,player);if(possibleMoves.length===0){return isKingInCheck(board,player)?(isMaximizingWhite?-Infinity:Infinity):0;}if(isMaximizingWhite){let maxEval=-Infinity;for(const move of possibleMoves){const tempBoard=applyMoveToBoardCopy(board,move);const currentEval=minimax(tempBoard,depth-1,getOpponent(player),alpha,beta,false);maxEval=Math.max(maxEval,currentEval);alpha=Math.max(alpha,currentEval);if(beta<=alpha)break;}return maxEval;}else{let minEval=Infinity;for(const move of possibleMoves){const tempBoard=applyMoveToBoardCopy(board,move);const currentEval=minimax(tempBoard,depth-1,getOpponent(player),alpha,beta,true);minEval=Math.min(minEval,currentEval);beta=Math.min(beta,currentEval);if(beta<=alpha)break;}return minEval;}}
-        function findBestMoveMinimax(currentBoardState,player,depth){let bestMove=null;let bestScore;const possibleMoves=generateAllPossibleMoves(currentBoardState,player);if(possibleMoves.length===0){return null;}let topMovesForDisplay = [];if(player===PlayerColor.WHITE){bestScore=-Infinity;for(const move of possibleMoves){const piece = currentBoardState[move.start.row][move.start.col]; if(piece.type === PieceType.EMPTY) continue; const tempBoard=applyMoveToBoardCopy(currentBoardState,move);const score=minimax(tempBoard,depth-1,getOpponent(player),-Infinity,Infinity,false);topMovesForDisplay.push({move:move, score:score, piece:piece});if(score>bestScore){bestScore=score;bestMove={...move,piece:piece.clone(),score:score};}}}else{bestScore=Infinity;for(const move of possibleMoves){const piece = currentBoardState[move.start.row][move.start.col]; if(piece.type === PieceType.EMPTY) continue; const tempBoard=applyMoveToBoardCopy(currentBoardState,move);const score=minimax(tempBoard,depth-1,getOpponent(player),-Infinity,Infinity,true);topMovesForDisplay.push({move:move, score:score, piece:piece});if(score<bestScore){bestScore=score;bestMove={...move,piece:piece.clone(),score:score};}}}if(player===PlayerColor.BLACK)topMovesForDisplay.sort((a,b)=>a.score-b.score);else topMovesForDisplay.sort((a,b)=>b.score-a.score);displayTopMoves(topMovesForDisplay.slice(0,3));if(!bestMove&&possibleMoves.length>0){const firstValidMove = possibleMoves[0]; bestMove={...firstValidMove,piece:currentBoardState[firstValidMove.start.row][firstValidMove.start.col].clone(),score:bestScore};}return bestMove;}
-        function makeAIMove(){if(isGameOverState||currentPlayer!==PlayerColor.BLACK)return;setMessage("AI calculating...");setTimeout(()=>{if(isGameOverState){isPlayerTurn=(currentPlayer===PlayerColor.WHITE);return;}const bestMove=findBestMoveMinimax(boardLogic,PlayerColor.BLACK,AI_SEARCH_DEPTH);if(bestMove && bestMove.piece){const playerWhoMoved = currentPlayer;makeMoveLogic(bestMove.start.row,bestMove.start.col,bestMove.end.row,bestMove.end.col);refresh3DPieceDisplay();const pieceMovedName=Object.keys(PieceType).find(k=>PieceType[k]===bestMove.piece.type)||"Piece";setMessage(`AI moved ${pieceMovedName}.`);if(isKingInCheck(boardLogic,PlayerColor.WHITE)){playSound(audioCheck);setMessage(`AI moved ${pieceMovedName}. Check!`);}if(isKingCaptured(boardLogic,PlayerColor.WHITE)){setMessage("BLACK WINS!");isGameOverState=true;stopPlayerTimer();stopCurrentMoveTimer();updateDigitalClocks();playSound(audioWin);return;}if(isGameOver(boardLogic,PlayerColor.WHITE)){isGameOverState=true;stopPlayerTimer();stopCurrentMoveTimer();updateDigitalClocks();return;}switchPlayer();if(!isGameOverState){pressClockButton(playerWhoMoved);}}else{setMessage("AI has no valid moves or error.");if(!isGameOver(boardLogic,PlayerColor.BLACK)){isGameOverState=true;}stopPlayerTimer();stopCurrentMoveTimer();}updateDigitalClocks();},700);}
-        function displayTopMoves(moves){if(!aiTrainerPanelElement||!topMovesListElement)return;if(moves&&moves.length>0){aiTrainerPanelElement.style.display='block';topMovesListElement.innerHTML='';moves.forEach((m,index)=>{if(!m.piece) return; const pieceName=Object.keys(PieceType).find(k=>PieceType[k]===m.piece.type)||"P";const moveStr=`${pieceName[0]}: ${String.fromCharCode(97+m.move.start.col)}${8-m.move.start.row} -> ${String.fromCharCode(97+m.move.end.col)}${8-m.move.end.row}`;const scoreStr=`(Eval: ${m.score.toFixed(1)})`;topMovesListElement.innerHTML+=`<div>${index+1}. ${moveStr} ${scoreStr}</div>`;});}else{aiTrainerPanelElement.style.display='none';}}
-
-        // --- ANIMATION LOOP ---
+        function onBoardClick(event){if(isGameOverState || !isPlayerTurn ){ return; }event.preventDefault(); setMessage("");const mouse=new THREE.Vector2((event.clientX/renderer.domElement.clientWidth)*2-1,-(event.clientY/renderer.domElement.clientHeight)*2+1);const raycaster=new THREE.Raycaster(); raycaster.setFromCamera(mouse,camera);const intersectableObjects = [...boardGroup.children]; const intersects=raycaster.intersectObjects(intersectableObjects,true);if (intersects.length > 0) {let clickedUserData = null;for (let i = 0; i < intersects.length; i++) {let obj = intersects[i].object;while (obj.parent && obj.parent !== scene && !(obj.userData && obj.userData.type)) { obj = obj.parent; }if (obj.userData && (obj.userData.type === 'square' || obj.userData.type === 'piece')) {clickedUserData = obj.userData; break;}}if (clickedUserData) {if (currentPlayer !== PlayerColor.WHITE || !isPlayerTurn) {setMessage("Wait for your turn or AI move.");return;}const r = clickedUserData.row; const c = clickedUserData.col;if (selectedPieceInfo === null) {if (boardLogic[r][c].type !== PieceType.EMPTY && boardLogic[r][c].color === currentPlayer) {selectedPieceInfo = { pieceLogic: boardLogic[r][c], row: r, col: c };refresh3DPieceDisplay(true);} else if (boardLogic[r][c].type !== PieceType.EMPTY) {setMessage("Not your piece!"); refresh3DPieceDisplay();} else {refresh3DPieceDisplay();}} else {if (isValidMove(selectedPieceInfo.row, selectedPieceInfo.col, r, c, selectedPieceInfo.pieceLogic, currentPlayer, boardLogic, true)) {const playerWhoMoved = currentPlayer;makeMoveLogic(selectedPieceInfo.row, selectedPieceInfo.col, r, c);const opponentColor = getOpponent(currentPlayer);if (isKingInCheck(boardLogic, opponentColor)) { playSound(audioCheck); setMessage("Check!"); }if (isKingCaptured(boardLogic, opponentColor)) {setMessage((Object.keys(PlayerColor).find(k => PlayerColor[k] === currentPlayer) || "Player") + " WINS!");isGameOverState = true; isPlayerTurn = false; stopPlayerTimer(); stopCurrentMoveTimer(); updateDigitalClocks();if (currentPlayer === PlayerColor.WHITE) playSound(audioWin); else playSound(audioLose);selectedPieceInfo = null; refresh3DPieceDisplay(); return;}if (isGameOver(boardLogic, opponentColor)) {isGameOverState = true; isPlayerTurn = false; stopPlayerTimer(); stopCurrentMoveTimer(); updateDigitalClocks();selectedPieceInfo = null; refresh3DPieceDisplay(); return;}switchPlayer();pressClockButton(playerWhoMoved);selectedPieceInfo = null;refresh3DPieceDisplay();if (currentPlayer === PlayerColor.BLACK && !isGameOverState) {makeAIMove();}} else {if (boardLogic[r][c].type !== PieceType.EMPTY && boardLogic[r][c].color === currentPlayer) {selectedPieceInfo = { pieceLogic: boardLogic[r][c], row: r, col: c };refresh3DPieceDisplay(true);} else {setMessage("Invalid move for " + (Object.keys(PieceType).find(k => PieceType[k] === selectedPieceInfo.pieceLogic.type) || "Piece"));selectedPieceInfo = null; refresh3DPieceDisplay();}}}}} else {selectedPieceInfo = null; refresh3DPieceDisplay();}}
+        const AI_SEARCH_DEPTH = 2;const pieceValues = { [PieceType.PAWN]: 100, [PieceType.KNIGHT]: 320, [PieceType.BISHOP]: 330, [PieceType.ROOK]: 500, [PieceType.QUEEN]: 900, [PieceType.KING]: 20000 };const pawnTable = [[0,0,0,0,0,0,0,0],[50,50,50,50,50,50,50,50],[10,10,20,30,30,20,10,10],[5,5,10,25,25,10,5,5],[0,0,0,20,20,0,0,0],[5,-5,-10,0,0,-10,-5,5],[5,10,10,-20,-20,10,10,5],[0,0,0,0,0,0,0,0]];function evaluateBoard(board){let score=0;for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const piece=board[r][c];if(piece.type!==PieceType.EMPTY){let value=pieceValues[piece.type]||0;if(piece.type===PieceType.PAWN){value+=(piece.color===PlayerColor.WHITE)?pawnTable[r][c]:pawnTable[7-r][c];}if(piece.color===PlayerColor.WHITE){score+=value;}else{score-=value;}}}}return score;}function generateAllPossibleMoves(currentBoard,player){const moves=[];for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){if(currentBoard[r][c].color===player){const piece = currentBoard[r][c]; if(piece.type === PieceType.EMPTY) continue; for(let tr=0;tr<BOARD_LOGIC_SIZE;tr++){for(let tc=0;tc<BOARD_LOGIC_SIZE;tc++){if(isValidMove(r,c,tr,tc,piece,player,currentBoard,false)){const tempBoardAfterMove=applyMoveToBoardCopy(currentBoard,{start:{row:r,col:c},end:{row:tr,col:tc}});if(!isKingInCheck(tempBoardAfterMove,player)){moves.push({start:{row:r,col:c},end:{row:tr,col:tc}});}}}}}}}return moves;}function applyMoveToBoardCopy(originalBoard,move){const newBoard=originalBoard.map(row=>row.map(p=>p.clone()));const pieceToMove=newBoard[move.start.row][move.start.col];if(pieceToMove.type===PieceType.PAWN){if((pieceToMove.color===PlayerColor.WHITE&&move.end.row===0)||(pieceToMove.color===PlayerColor.BLACK&&move.end.row===BOARD_LOGIC_SIZE-1)){pieceToMove.type=PieceType.QUEEN;}}newBoard[move.end.row][move.end.col]=pieceToMove;newBoard[move.start.row][move.start.col]=new Piece(PieceType.EMPTY,PlayerColor.NONE);if(newBoard[move.end.row][move.end.col].type!==PieceType.EMPTY){newBoard[move.end.row][move.end.col].hasMoved=true;}return newBoard;}function isKingInCheck(boardState,playerColor){let kingR=-1,kingC=-1;for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){if(boardState[r][c].type===PieceType.KING&&boardState[r][c].color===playerColor){kingR=r;kingC=c;break;}}if(kingR===-1)return true;}const opponentColor=getOpponent(playerColor);for(let r=0;r<BOARD_LOGIC_SIZE;r++){for(let c=0;c<BOARD_LOGIC_SIZE;c++){const piece=boardState[r][c];if(piece.color===opponentColor && piece.type !== PieceType.EMPTY){if(isValidMove(r,c,kingR,kingC,piece,opponentColor,boardState,false)){return true;}}}}return false;}function isGameOver(boardState,playerToMove){const possibleMoves=generateAllPossibleMoves(boardState,playerToMove);if(possibleMoves.length===0){if(isKingInCheck(boardState,playerToMove)){const winnerName=Object.keys(PlayerColor).find(k=>PlayerColor[k]===getOpponent(playerToMove))||"Opponent";setMessage(winnerName+" WINS by Checkmate!");if(getOpponent(playerToMove)===PlayerColor.WHITE) playSound(audioWin); else playSound(audioLose);return true;}else{setMessage("STALEMATE!");playSound(audioStalemate);return true;}}return false;}function minimax(board,depth,player,alpha,beta,isMaximizingWhite){if(depth===0||isGameOver(board,player)){return evaluateBoard(board);}const possibleMoves=generateAllPossibleMoves(board,player);if(possibleMoves.length===0){return isKingInCheck(board,player)?(isMaximizingWhite?-Infinity:Infinity):0;}if(isMaximizingWhite){let maxEval=-Infinity;for(const move of possibleMoves){const tempBoard=applyMoveToBoardCopy(board,move);const currentEval=minimax(tempBoard,depth-1,getOpponent(player),alpha,beta,false);maxEval=Math.max(maxEval,currentEval);alpha=Math.max(alpha,currentEval);if(beta<=alpha)break;}return maxEval;}else{let minEval=Infinity;for(const move of possibleMoves){const tempBoard=applyMoveToBoardCopy(board,move);const currentEval=minimax(tempBoard,depth-1,getOpponent(player),alpha,beta,true);minEval=Math.min(minEval,currentEval);beta=Math.min(beta,currentEval);if(beta<=alpha)break;}return minEval;}}function findBestMoveMinimax(currentBoardState,player,depth){let bestMove=null;let bestScore;const possibleMoves=generateAllPossibleMoves(currentBoardState,player);if(possibleMoves.length===0){return null;}let topMovesForDisplay = [];if(player===PlayerColor.WHITE){bestScore=-Infinity;for(const move of possibleMoves){const piece = currentBoardState[move.start.row][move.start.col]; if(piece.type === PieceType.EMPTY) continue; const tempBoard=applyMoveToBoardCopy(currentBoardState,move);const score=minimax(tempBoard,depth-1,getOpponent(player),-Infinity,Infinity,false);topMovesForDisplay.push({move:move, score:score, piece:piece});if(score>bestScore){bestScore=score;bestMove={...move,piece:piece.clone(),score:score};}}}else{bestScore=Infinity;for(const move of possibleMoves){const piece = currentBoardState[move.start.row][move.start.col]; if(piece.type === PieceType.EMPTY) continue; const tempBoard=applyMoveToBoardCopy(currentBoardState,move);const score=minimax(tempBoard,depth-1,getOpponent(player),-Infinity,Infinity,true);topMovesForDisplay.push({move:move, score:score, piece:piece});if(score<bestScore){bestScore=score;bestMove={...move,piece:piece.clone(),score:score};}}}if(player===PlayerColor.BLACK)topMovesForDisplay.sort((a,b)=>a.score-b.score);else topMovesForDisplay.sort((a,b)=>b.score-a.score);displayTopMoves(topMovesForDisplay.slice(0,3));if(!bestMove&&possibleMoves.length>0){const firstValidMove = possibleMoves[0]; bestMove={...firstValidMove,piece:currentBoardState[firstValidMove.start.row][firstValidMove.start.col].clone(),score:bestScore};}return bestMove;}function makeAIMove(){if(isGameOverState||currentPlayer!==PlayerColor.BLACK)return;setMessage("AI calculating...");setTimeout(()=>{if(isGameOverState){isPlayerTurn=(currentPlayer===PlayerColor.WHITE);return;}const bestMove=findBestMoveMinimax(boardLogic,PlayerColor.BLACK,AI_SEARCH_DEPTH);if(bestMove && bestMove.piece){const playerWhoMoved = currentPlayer;makeMoveLogic(bestMove.start.row,bestMove.start.col,bestMove.end.row,bestMove.end.col);refresh3DPieceDisplay();const pieceMovedName=Object.keys(PieceType).find(k=>PieceType[k]===bestMove.piece.type)||"Piece";setMessage(`AI moved ${pieceMovedName}.`);if(isKingInCheck(boardLogic,PlayerColor.WHITE)){playSound(audioCheck);setMessage(`AI moved ${pieceMovedName}. Check!`);}if(isKingCaptured(boardLogic,PlayerColor.WHITE)){setMessage("BLACK WINS!");isGameOverState=true;stopPlayerTimer();stopCurrentMoveTimer();updateDigitalClocks();playSound(audioWin);return;}if(isGameOver(boardLogic,PlayerColor.WHITE)){isGameOverState=true;stopPlayerTimer();stopCurrentMoveTimer();updateDigitalClocks();return;}switchPlayer();if(!isGameOverState){pressClockButton(playerWhoMoved);}}else{setMessage("AI has no valid moves or error.");if(!isGameOver(boardLogic,PlayerColor.BLACK)){isGameOverState=true;}stopPlayerTimer();stopCurrentMoveTimer();}updateDigitalClocks();},700);}function displayTopMoves(moves){if(!aiTrainerPanelElement||!topMovesListElement)return;if(moves&&moves.length>0){aiTrainerPanelElement.style.display='block';topMovesListElement.innerHTML='';moves.forEach((m,index)=>{if(!m.piece) return; const pieceName=Object.keys(PieceType).find(k=>PieceType[k]===m.piece.type)||"P";const moveStr=`${pieceName[0]}: ${String.fromCharCode(97+m.move.start.col)}${8-m.move.start.row} -> ${String.fromCharCode(97+m.move.end.col)}${8-m.move.end.row}`;const scoreStr=`(Eval: ${m.score.toFixed(1)})`;topMovesListElement.innerHTML+=`<div>${index+1}. ${moveStr} ${scoreStr}</div>`;});}else{aiTrainerPanelElement.style.display='none';}}
         function animateParticles(){if(!particlesPoints||!particlesPoints.geometry||PARTICLE_COUNT===0)return;const positions=particlesPoints.geometry.attributes.position.array;const numParticles=positions.length/3;const particleAnimationSpread=SQUARE_3D_SIZE*BOARD_LOGIC_SIZE*3.0; const particleZResetMax=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+3000; const particleZResetMin=SQUARE_3D_SIZE*(BOARD_LOGIC_SIZE*0.5+2)+200; for(let i=0;i<numParticles;i++){const i3=i*3;positions[i3+0]+=(Math.random()-0.5)*0.06;positions[i3+1]+=(Math.random()-0.5)*0.06;positions[i3+2]+=(Math.random()-0.5)*0.02;if(Math.abs(positions[i3+0])>particleAnimationSpread*1.2)positions[i3+0]*=-0.999;if(Math.abs(positions[i3+1])>particleAnimationSpread*0.7)positions[i3+1]*=-0.999;if(positions[i3+2]>particleZResetMax||positions[i3+2]<particleZResetMin){positions[i3+2]=particleZResetMin+Math.random()*(particleZResetMax-particleZResetMin-100);}}particlesPoints.geometry.attributes.position.needsUpdate=true;}
         function animate(time){requestAnimationFrame(animate);if(particlesPoints) animateParticles();renderer.render(scene,camera);}
 
