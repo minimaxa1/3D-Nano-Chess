@@ -1,4 +1,4 @@
-# 3D Nano Chess 🌌
+# 3D Nano Chess 
 
 ![3d Nano Chess](https://github.com/user-attachments/assets/bc2ec73d-9794-4b0c-9f43-997f813580c9)
 
@@ -8,7 +8,7 @@ Welcome to 3D Nano Chess! This is a browser-based 3D chess game featuring:
 *   **Full 3D Graphics:** Built with Three.js for an immersive chess experience.
 *   **AI Opponent:** Challenge a built-in AI to test your skills.
 *   **WebRTC Video Chat:** Play against a friend and see them in real-time with peer-to-peer video chat.
-*   **Retro Radio:** Enjoy some background tunes while you strategize.
+*   **Retro Mp3 Radio:** Enjoy some background tunes while you strategize.
 *   **AI Move Suggestions:** Get hints from the AI to improve your game.
 
 This project demonstrates the integration of various web technologies to create an interactive online game.
@@ -24,7 +24,7 @@ This project demonstrates the integration of various web technologies to create 
 *   Single-player mode against an AI.
 *   Two-player mode with WebRTC video chat.
 *   UI for game timers, turn indication, and messages.
-*   In-game retro radio player.
+*   In-game retro radio Mp3 player.
 *   AI move suggestions panel.
 *   Dynamic particle effects for ambiance.
 
